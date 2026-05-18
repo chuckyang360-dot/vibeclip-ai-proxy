@@ -28,6 +28,24 @@ def get_env(key: str, default: str | None = None) -> str | None:
     return val
 
 
+def infer_upstream_provider_label(base_url: str) -> str:
+    u = (base_url or "").strip().lower()
+    if "x.ai" in u:
+        return "xai"
+    if "openai.com" in u:
+        return "openai"
+    return "openai_compatible"
+
+
+def resolve_s1_vision_model() -> tuple[str, str]:
+    """Return (model_id, env_key_used). No implicit gpt-4o-mini — must be explicit config."""
+    for key in ("S1_VISION_MODEL", "XAI_MODEL", "OPENAI_MODEL"):
+        v = get_env(key)
+        if v:
+            return v.strip(), key
+    return "", ""
+
+
 def truncate_for_log(text: str, max_len: int = 500) -> str:
     if len(text) <= max_len:
         return text
@@ -99,7 +117,21 @@ async def s1_vision(
         raise HTTPException(status_code=500, detail="openai_api_key_not_configured")
 
     base_url = get_env("OPENAI_BASE_URL", "https://api.openai.com/v1") or "https://api.openai.com/v1"
-    model = get_env("S1_VISION_MODEL", "gpt-4o-mini") or "gpt-4o-mini"
+    model, model_source_env = resolve_s1_vision_model()
+    if not model:
+        print(
+            f"[AI_PROXY_S1_VISION_ERROR] request_id={request_id} "
+            f"error_type=model_not_configured message="
+            f"{truncate_for_log('set S1_VISION_MODEL or XAI_MODEL or OPENAI_MODEL')}"
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "s1_vision_model_not_configured: set one of "
+                "S1_VISION_MODEL, XAI_MODEL, OPENAI_MODEL (no default model)"
+            ),
+        )
+    provider_label = infer_upstream_provider_label(base_url)
     timeout_raw = get_env("REQUEST_TIMEOUT_SECONDS", "120") or "120"
     try:
         timeout_seconds = float(timeout_raw)
@@ -110,7 +142,8 @@ async def s1_vision(
 
     print(
         f"[AI_PROXY_S1_VISION_REQUEST] request_id={request_id} "
-        f"image_count={image_count} model={model}"
+        f"provider={provider_label} base_url={base_url} model={model} "
+        f"model_env={model_source_env} image_count={image_count}"
     )
 
     user_content: list[dict[str, Any]] = []

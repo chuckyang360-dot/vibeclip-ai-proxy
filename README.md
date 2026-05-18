@@ -21,9 +21,13 @@
 |------|------|
 | `PROXY_AUTH_TOKEN` | 内部鉴权 Token（**必填**，缺失则请求返回 500） |
 | `OPENAI_API_KEY` | OpenAI API Key（**必填**，缺失则请求返回 500） |
-| `OPENAI_BASE_URL` | OpenAI 兼容 API 根路径，默认 `https://api.openai.com/v1` |
-| `S1_VISION_MODEL` | 模型名，默认 `gpt-4o-mini` |
+| `OPENAI_BASE_URL` | OpenAI 兼容 API 根路径，默认 `https://api.openai.com/v1`（xAI 时多为 `https://api.x.ai/v1`） |
+| `S1_VISION_MODEL` | （可选）仅覆盖 S1 视觉所用模型名；未设置则按顺序尝试 `XAI_MODEL`、`OPENAI_MODEL` |
+| `XAI_MODEL` | （可选）与 xAI `OPENAI_BASE_URL` 搭配；Railway 未单独设 `S1_VISION_MODEL` 时 S1 会用它 |
+| `OPENAI_MODEL` | （可选）官方 OpenAI 等场景的模型名后备 |
 | `REQUEST_TIMEOUT_SECONDS` | 上游请求超时（秒），默认 `120` |
+
+**模型名必填其一**：`S1_VISION_MODEL`、`XAI_MODEL`、`OPENAI_MODEL` 至少配置一个。代理**不再**默认 `gpt-4o-mini`（在 xAI 等上游上会报 Model not found）。
 
 参考 `.env.example` 填写本地或 Railway 变量。
 
@@ -66,10 +70,10 @@ curl -X POST "http://localhost:8000/s1/vision" \
 4. 在 Railway **Variables** 中配置下列环境变量（至少 `PROXY_AUTH_TOKEN`、`OPENAI_API_KEY`）：
    - `PROXY_AUTH_TOKEN`
    - `OPENAI_API_KEY`
-   - （可选）`OPENAI_BASE_URL`、`S1_VISION_MODEL`、`REQUEST_TIMEOUT_SECONDS`
+   - （可选）`OPENAI_BASE_URL`、模型名三选一见上表、`REQUEST_TIMEOUT_SECONDS`
 5. 部署完成后，将分配的公开 URL 提供给 vibeclip_ali 后端作为代理地址（例如 `https://<your-service>.up.railway.app/s1/vision`）。
 
 ## Railway 环境变量清单
 
-- **必填**：`PROXY_AUTH_TOKEN`、`OPENAI_API_KEY`
-- **可选**：`OPENAI_BASE_URL`、`S1_VISION_MODEL`、`REQUEST_TIMEOUT_SECONDS`
+- **必填**：`PROXY_AUTH_TOKEN`、`OPENAI_API_KEY`、以及 **`S1_VISION_MODEL` / `XAI_MODEL` / `OPENAI_MODEL` 三者至少其一**
+- **常用可选**：`OPENAI_BASE_URL`、`REQUEST_TIMEOUT_SECONDS`
