@@ -30,6 +30,21 @@ class S1VisionResponse(BaseModel):
     raw_text: str
 
 
+class ImageGenerationRequest(BaseModel):
+    prompt: str
+    response_format: str = Field(default="url", description="url | b64_json")
+    aspect_ratio: str | None = None
+    resolution: str | None = None
+    project_id: int | None = None
+    target_type: str | None = None
+    target_id: int | None = None
+
+
+class ImageGenerationResponse(BaseModel):
+    url: str | None = None
+    b64_json: str | None = None
+
+
 def get_env(key: str, default: str | None = None) -> str | None:
     val = os.getenv(key)
     if val is None or val.strip() == "":
@@ -62,6 +77,15 @@ def resolve_text_chat_model() -> tuple[str, str]:
         if v:
             return v.strip(), key
     return "", ""
+
+
+def resolve_image_generation_model() -> tuple[str, str]:
+    """S3 asset images: prefer dedicated image model env, then shared XAI_MODEL."""
+    for key in ("XAI_IMAGE_MODEL", "SHORT_DRAMA_XAI_IMAGE_MODEL", "XAI_MODEL", "OPENAI_MODEL"):
+        v = get_env(key)
+        if v:
+            return v.strip(), key
+    return "grok-imagine-image", "default_grok_imagine_image"
 
 
 def truncate_for_log(text: str, max_len: int = 500) -> str:
@@ -279,6 +303,156 @@ async def text_completions(
             f"[AI_PROXY_TEXT_COMPLETION_ERROR] request_id={request_id} "
             f"error_type=unexpected_error message={truncate_for_log(str(exc))} "
             f"elapsed_ms={elapsed_ms}"
+        )
+        raise HTTPException(status_code=500, detail="unexpected_error")
+
+
+@app.post("/images/generations", response_model=ImageGenerationResponse)
+async def images_generations(
+    body: ImageGenerationRequest,
+    authorization: Annotated[str | None, Header(alias="Authorization")] = None,
+) -> ImageGenerationResponse:
+    """OpenAI-compatible POST /images/generations via Railway (xAI grok-imagine-image, etc.)."""
+    request_id = str(uuid.uuid4())
+    require_proxy_auth(authorization)
+
+    openai_key = os.getenv("OPENAI_API_KEY")
+    if openai_key is None or openai_key.strip() == "":
+        raise HTTPException(status_code=500, detail="openai_api_key_not_configured")
+
+    base_url = get_env("OPENAI_BASE_URL", "https://api.openai.com/v1") or "https://api.openai.com/v1"
+    model, model_source_env = resolve_image_generation_model()
+    provider_label = infer_upstream_provider_label(base_url)
+    timeout_raw = get_env("REQUEST_TIMEOUT_SECONDS", "120") or "120"
+    try:
+        timeout_seconds = float(timeout_raw)
+    except ValueError:
+        timeout_seconds = 120.0
+
+    timeout = httpx.Timeout(timeout_seconds)
+    fmt = (body.response_format or "url").strip().lower()
+    payload: dict[str, Any] = {
+        "model": model,
+        "prompt": body.prompt,
+        "n": 1,
+        "response_format": fmt,
+    }
+    if body.aspect_ratio:
+        payload["aspect_ratio"] = body.aspect_ratio
+    if body.resolution:
+        payload["resolution"] = body.resolution
+
+    upstream_url = f"{base_url.rstrip('/')}/images/generations"
+    headers = {
+        "Authorization": f"Bearer {openai_key}",
+        "Content-Type": "application/json",
+    }
+
+    print(
+        f"[AI_PROXY_IMAGE_REQUEST] request_id={request_id} "
+        f"provider={provider_label} base_url={base_url} model={model} model_env={model_source_env} "
+        f"project_id={body.project_id} target_type={body.target_type or ''} target_id={body.target_id} "
+        f"response_format={fmt} timeout_seconds={timeout_seconds}"
+    )
+
+    start = time.perf_counter()
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(upstream_url, headers=headers, json=payload)
+
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+
+        if resp.status_code >= 400:
+            body_preview = truncate_for_log(resp.text[:800], max_len=800)
+            print(
+                f"[AI_PROXY_IMAGE_ERROR] request_id={request_id} "
+                f"error_type=upstream_http status_code={resp.status_code} "
+                f"message={body_preview} elapsed_ms={elapsed_ms}"
+            )
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "error": "upstream_error",
+                    "status_code": resp.status_code,
+                    "body": resp.text[:800],
+                },
+            )
+
+        try:
+            data = resp.json()
+        except json.JSONDecodeError as exc:
+            print(
+                f"[AI_PROXY_IMAGE_ERROR] request_id={request_id} "
+                f"error_type=json_decode_error message={truncate_for_log(str(exc))} "
+                f"elapsed_ms={elapsed_ms}"
+            )
+            raise HTTPException(status_code=500, detail="unexpected_error")
+
+        items = data.get("data")
+        if not isinstance(items, list) or not items:
+            print(
+                f"[AI_PROXY_IMAGE_ERROR] request_id={request_id} "
+                f"error_type=invalid_upstream_response message=missing data[] elapsed_ms={elapsed_ms}"
+            )
+            raise HTTPException(status_code=502, detail="invalid_upstream_response")
+
+        first = items[0]
+        if not isinstance(first, dict):
+            raise HTTPException(status_code=502, detail="invalid_upstream_response")
+
+        if fmt == "b64_json":
+            b64 = first.get("b64_json")
+            if not isinstance(b64, str) or not b64.strip():
+                raise HTTPException(status_code=502, detail="missing_b64_json")
+            print(
+                f"[AI_PROXY_IMAGE_RESPONSE] request_id={request_id} success=true format=b64_json "
+                f"elapsed_ms={elapsed_ms}"
+            )
+            return ImageGenerationResponse(b64_json=b64.strip())
+
+        url = first.get("url")
+        if not isinstance(url, str) or not url.strip():
+            raise HTTPException(status_code=502, detail="missing_image_url")
+
+        print(
+            f"[AI_PROXY_IMAGE_RESPONSE] request_id={request_id} success=true format=url "
+            f"elapsed_ms={elapsed_ms}"
+        )
+        return ImageGenerationResponse(url=url.strip())
+
+    except HTTPException:
+        raise
+
+    except httpx.TimeoutException:
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        print(
+            f"[AI_PROXY_IMAGE_ERROR] request_id={request_id} "
+            f"error_type=upstream_timeout elapsed_ms={elapsed_ms}"
+        )
+        raise HTTPException(status_code=504, detail="upstream_timeout")
+
+    except httpx.ConnectError as exc:
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        print(
+            f"[AI_PROXY_IMAGE_ERROR] request_id={request_id} "
+            f"error_type=network_connect_error message={truncate_for_log(str(exc))} elapsed_ms={elapsed_ms}"
+        )
+        raise HTTPException(status_code=502, detail="network_connect_error")
+
+    except httpx.RequestError as exc:
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        print(
+            f"[AI_PROXY_IMAGE_ERROR] request_id={request_id} "
+            f"error_type=network_connect_error message={truncate_for_log(str(exc))} elapsed_ms={elapsed_ms}"
+        )
+        raise HTTPException(status_code=502, detail="network_connect_error")
+
+    except Exception as exc:
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        print(
+            f"[AI_PROXY_IMAGE_ERROR] request_id={request_id} "
+            f"error_type=unexpected_error message={truncate_for_log(str(exc))} elapsed_ms={elapsed_ms}"
         )
         raise HTTPException(status_code=500, detail="unexpected_error")
 

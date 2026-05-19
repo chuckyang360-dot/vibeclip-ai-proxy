@@ -13,8 +13,9 @@
 - `GET /health`：健康检查。
 - `POST /s1/vision`：S1 产品图片理解；校验内部 Token；将图片 URL、`system_prompt`、`user_payload` 发往 OpenAI-compatible `chat/completions`；返回 `choices[0].message.content` 作为 `raw_text`。
 - `POST /text/completions`：通用文本（及可选 `image_urls` 多模态）`chat/completions` 代理。用于阿里云后端在 `AI_PROVIDER=railway_proxy` 时生成 **creative_brief**、S2 等结构化 JSON（请求体为 `system_prompt` + `user_text`）；返回同样为 `{"raw_text": "..."}`。
+- `POST /images/generations`：S3 资产文生图；转发 OpenAI-compatible `POST /images/generations`（如 xAI `grok-imagine-image`）；返回 `{"url": "..."}` 或 `{"b64_json": "..."}`。
 
-不包含数据库、前端、通用 AI 网关、S2/S3/S4/S5、**业务** JSON 解析或业务规则（后端仍负责 `raw_text` → JSON 解析与 schema；本服务只做鉴权 + 上游转发）。
+不包含数据库、前端、通用 AI 网关、S4 视频、S5、**业务** JSON 解析或业务规则（后端仍负责 `raw_text` → JSON 解析与 schema；本服务只做鉴权 + 上游转发）。
 
 ## `POST /text/completions` 请求体（摘要）
 
