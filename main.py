@@ -3,7 +3,7 @@ import json
 import os
 import time
 import uuid
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException
@@ -78,6 +78,9 @@ class XaiVideoGenerationResponse(BaseModel):
     model: str = ""
     request_id: str = ""
     video_url: str | None = None
+    xai_video_url: str | None = None
+    storage: str | None = None
+    r2_key: str | None = None
     duration_seconds: int | None = None
     error_code: str | None = None
     error_message: str | None = None
