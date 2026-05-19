@@ -12,8 +12,22 @@
 
 - `GET /health`：健康检查。
 - `POST /s1/vision`：S1 产品图片理解；校验内部 Token；将图片 URL、`system_prompt`、`user_payload` 发往 OpenAI-compatible `chat/completions`；返回 `choices[0].message.content` 作为 `raw_text`。
+- `POST /text/completions`：通用文本（及可选 `image_urls` 多模态）`chat/completions` 代理。用于阿里云后端在 `AI_PROVIDER=railway_proxy` 时生成 **creative_brief**、S2 等结构化 JSON（请求体为 `system_prompt` + `user_text`）；返回同样为 `{"raw_text": "..."}`。
 
-不包含数据库、前端、通用 AI 网关、S2/S3/S4/S5、业务 JSON 解析或业务规则。
+不包含数据库、前端、通用 AI 网关、S2/S3/S4/S5、**业务** JSON 解析或业务规则（后端仍负责 `raw_text` → JSON 解析与 schema；本服务只做鉴权 + 上游转发）。
+
+## `POST /text/completions` 请求体（摘要）
+
+| 字段 | 说明 |
+|------|------|
+| `system_prompt` | 系统提示 |
+| `user_text` | 用户消息正文（通常为后端 `json.dumps(user_payload)`） |
+| `image_urls` | 可选；非空时与 S1 一致，走多模态 user content |
+| `max_tokens` | 默认 `8192` |
+| `temperature` | 默认 `0.2` |
+| `service_name` | 可选；写入日志，如 `creative_brief` |
+
+上游模型名由 **`XAI_TEXT_MODEL` → `XAI_MODEL` → `OPENAI_MODEL`** 的第一个非空值决定（与 `/s1/vision` 所用 `resolve_s1_vision_model` 独立，便于文本与视觉使用不同模型变量）。
 
 ## 环境变量
 
@@ -23,11 +37,12 @@
 | `OPENAI_API_KEY` | OpenAI API Key（**必填**，缺失则请求返回 500） |
 | `OPENAI_BASE_URL` | OpenAI 兼容 API 根路径，默认 `https://api.openai.com/v1`（xAI 时多为 `https://api.x.ai/v1`） |
 | `S1_VISION_MODEL` | （可选）仅覆盖 S1 视觉所用模型名；未设置则按顺序尝试 `XAI_MODEL`、`OPENAI_MODEL` |
-| `XAI_MODEL` | （可选）与 xAI `OPENAI_BASE_URL` 搭配；Railway 未单独设 `S1_VISION_MODEL` 时 S1 会用它 |
+| `XAI_TEXT_MODEL` | （可选）优先用于 **`/text/completions`**；未设置则用 `XAI_MODEL` |
+| `XAI_MODEL` | （可选）文本与 S1 视觉的后备共用 |
 | `OPENAI_MODEL` | （可选）官方 OpenAI 等场景的模型名后备 |
 | `REQUEST_TIMEOUT_SECONDS` | 上游请求超时（秒），默认 `120` |
 
-**模型名必填其一**：`S1_VISION_MODEL`、`XAI_MODEL`、`OPENAI_MODEL` 至少配置一个。代理**不再**默认 `gpt-4o-mini`（在 xAI 等上游上会报 Model not found）。
+**模型**：`/s1/vision` 须配置 `S1_VISION_MODEL`、`XAI_MODEL`、`OPENAI_MODEL` 之一；**`/text/completions`** 须配置 `XAI_TEXT_MODEL`、`XAI_MODEL`、`OPENAI_MODEL` 之一。若你在 Railway 只设了 `XAI_MODEL`，两条路由都会使用该值。
 
 参考 `.env.example` 填写本地或 Railway 变量。
 
