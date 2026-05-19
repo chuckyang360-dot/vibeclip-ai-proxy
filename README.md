@@ -13,7 +13,9 @@
 - `GET /health`：健康检查。
 - `POST /s1/vision`：S1 产品图片理解；校验内部 Token；将图片 URL、`system_prompt`、`user_payload` 发往 OpenAI-compatible `chat/completions`；返回 `choices[0].message.content` 作为 `raw_text`。
 - `POST /text/completions`：通用文本（及可选 `image_urls` 多模态）`chat/completions` 代理。用于阿里云后端在 `AI_PROVIDER=railway_proxy` 时生成 **creative_brief**、S2 等结构化 JSON（请求体为 `system_prompt` + `user_text`）；返回同样为 `{"raw_text": "..."}`。
-- `POST /images/generations`：S3 资产文生图；转发上游 `POST /images/generations`。请求体支持 `response_format` 为 `url` 或 `b64_json`。**成功响应统一为** `{"data": [{"b64_json": "<base64>"}], "mime_type": "<string>"}`：若上游返回 `b64_json` 则直接沿用（日志 `source=upstream_b64`）；若上游只返回临时 `url`，由 **Railway 侧下载图片字节** 再转 base64（日志 `source=url_downloaded`），避免大陆后端再访问 xAI 图片 URL。模型解析优先级仍见下文「图片模型」说明。
+- `POST /images/generations`：S3 资产文生图；转发上游 `POST /images/generations`。`response_format` 可选 **`url` \| `b64_json` \| `r2_url`**：
+  - **`url` / `b64_json`**：成功响应为 `{"data": [{"b64_json": "<base64>"}], "mime_type": "..."}`（上游若只给临时 URL，由 Railway 下载后再 base64；日志 `source=upstream_b64` / `url_downloaded`）。
+  - **`r2_url`（推荐阿里云后端）**：上游按 `b64_json` 拉取图片字节（若仅有 URL 仍会下载），写入 **Cloudflare R2** 后返回轻量 **`{"data": [{"url": "<R2 公网 URL>"}], "mime_type": "...", "storage": "r2"}`**，避免超大 JSON 导致大陆后端读响应超时。须配置 **`R2_*`** 环境变量。
 
 不包含数据库、前端、通用 AI 网关、S4 视频、S5、**业务** JSON 解析或业务规则（后端仍负责 `raw_text` → JSON 解析与 schema；本服务只做鉴权 + 上游转发）。
 
@@ -44,6 +46,11 @@
 | `IMAGE_MODEL` | （可选）图片接口第三顺位后备（在 `SHORT_DRAMA_XAI_IMAGE_MODEL` 之后） |
 | `OPENAI_MODEL` | （可选）官方 OpenAI 等场景的模型名后备 |
 | `REQUEST_TIMEOUT_SECONDS` | 上游请求超时（秒），默认 `120` |
+| `R2_ENDPOINT` | （**`response_format=r2_url` 必填**）R2 S3 API Endpoint |
+| `R2_ACCESS_KEY` | （同上）R2 Access Key |
+| `R2_SECRET_KEY` | （同上）R2 Secret Key |
+| `R2_BUCKET_NAME` | （同上）Bucket 名 |
+| `R2_PUBLIC_BASE_URL` | （同上）对外访问根 URL（无尾部 `/`），与对象 Key 拼接成最终 URL |
 
 **模型**：`/s1/vision` 须配置 `S1_VISION_MODEL`、`XAI_MODEL`、`OPENAI_MODEL` 之一；**`/text/completions`** 须配置 `XAI_TEXT_MODEL`、`XAI_MODEL`、`OPENAI_MODEL` 之一。**`/images/generations`** 使用请求体 `model` 或 `XAI_IMAGE_MODEL` 等图片专用变量，与 `XAI_MODEL` 分离，避免 grok-4.20 误走图片端点。
 

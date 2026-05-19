@@ -1,11 +1,16 @@
+import asyncio
 import base64
 import json
 import os
 import time
 import uuid
-from typing import Annotated, Any
+from typing import Annotated, Any, Union
+from urllib.parse import quote
 
+import boto3
 import httpx
+from botocore.config import Config
+from botocore.exceptions import ClientError
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
@@ -34,7 +39,10 @@ class S1VisionResponse(BaseModel):
 class ImageGenerationRequest(BaseModel):
     prompt: str
     model: str | None = Field(default=None, description="Image model id; when set, forwarded upstream as-is")
-    response_format: str = Field(default="url", description="url | b64_json")
+    response_format: str = Field(
+        default="url",
+        description="url | b64_json | r2_url (r2_url uploads to R2 and returns public URL only)",
+    )
     aspect_ratio: str | None = None
     resolution: str | None = None
     project_id: int | None = None
@@ -51,6 +59,16 @@ class ImageGenerationB64Response(BaseModel):
 
     data: list[ImageGenerationDataItem]
     mime_type: str
+
+
+class ImageGenerationDataUrlItem(BaseModel):
+    url: str
+
+
+class ImageGenerationR2UrlResponse(BaseModel):
+    data: list[ImageGenerationDataUrlItem]
+    mime_type: str
+    storage: str = Field(default="r2")
 
 
 _MAX_IMAGE_DOWNLOAD_BYTES = 25 * 1024 * 1024
@@ -146,6 +164,152 @@ def _resolve_mime_from_bytes(raw: bytes, content_type: str | None) -> str:
     if sniffed != "application/octet-stream":
         return sniffed
     return ct or "image/png"
+
+
+def extension_for_mime(mime_type: str) -> str:
+    m = (mime_type or "").strip().lower().split(";")[0].strip()
+    return {
+        "image/jpeg": ".jpg",
+        "image/jpg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+        "image/gif": ".gif",
+    }.get(m, ".bin")
+
+
+def sanitize_path_segment(seg: str | None, fallback: str = "unknown") -> str:
+    s = (seg or "").strip() or fallback
+    return s.replace("/", "_").replace("\\", "_")[:200]
+
+
+def build_r2_image_object_key(
+    *,
+    project_id: int | None,
+    target_type: str | None,
+    target_id: int | None,
+    request_id: str,
+    mime_type: str,
+) -> str:
+    ext = extension_for_mime(mime_type)
+    pid = project_id if project_id is not None else 0
+    tid = target_id if target_id is not None else 0
+    tt = sanitize_path_segment(target_type, "unknown")
+    return f"short-drama/assets/{pid}/{tt}/{tid}/{request_id}{ext}"
+
+
+def load_r2_settings() -> tuple[str, str, str, str, str]:
+    endpoint = (get_env("R2_ENDPOINT") or "").strip()
+    access = (get_env("R2_ACCESS_KEY") or "").strip()
+    secret = (get_env("R2_SECRET_KEY") or "").strip()
+    bucket = (get_env("R2_BUCKET_NAME") or "").strip()
+    public_base = (get_env("R2_PUBLIC_BASE_URL") or "").strip().rstrip("/")
+    return endpoint, access, secret, bucket, public_base
+
+
+def upload_bytes_to_r2_sync(*, object_key: str, data: bytes, content_type: str) -> None:
+    endpoint, access, secret, bucket, _public = load_r2_settings()
+    if not all((endpoint, access, secret, bucket)):
+        raise RuntimeError("r2_env_incomplete")
+
+    client = boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=access,
+        aws_secret_access_key=secret,
+        region_name="auto",
+        config=Config(signature_version="s3v4"),
+    )
+    client.put_object(Bucket=bucket, Key=object_key, Body=data, ContentType=content_type)
+
+
+async def extract_image_bytes_from_upstream_item(
+    client: httpx.AsyncClient,
+    first: dict[str, Any],
+    *,
+    request_id: str,
+    requested_model_log: str,
+    resolved_model: str,
+    start: float,
+) -> tuple[bytes, str, str]:
+    """Return (raw_bytes, mime_type, source_tag) where source_tag is upstream_b64 | url_downloaded."""
+    b64_in = first.get("b64_json")
+    url_in = first.get("url")
+
+    if isinstance(b64_in, str) and b64_in.strip():
+        fb64 = b64_in.strip()
+        try:
+            raw_bytes = base64.standard_b64decode(fb64)
+        except Exception:
+            elapsed_ms = int((time.perf_counter() - start) * 1000)
+            print(
+                f"[AI_PROXY_IMAGE_ERROR] request_id={request_id} "
+                f"error_type=invalid_b64_json requested_model={requested_model_log} "
+                f"resolved_model={resolved_model} elapsed_ms={elapsed_ms}"
+            )
+            raise HTTPException(status_code=502, detail="invalid_b64_json")
+        mime_type = _resolve_mime_from_bytes(raw_bytes, None)
+        return raw_bytes, mime_type, "upstream_b64"
+
+    if isinstance(url_in, str) and url_in.strip():
+        img_url = url_in.strip()
+        try:
+            dl = await client.get(img_url, follow_redirects=True)
+        except httpx.TimeoutException:
+            elapsed_ms = int((time.perf_counter() - start) * 1000)
+            print(
+                f"[AI_PROXY_IMAGE_ERROR] request_id={request_id} "
+                f"error_type=upstream_image_download_failed reason=timeout "
+                f"requested_model={requested_model_log} resolved_model={resolved_model} elapsed_ms={elapsed_ms}"
+            )
+            raise HTTPException(status_code=504, detail="upstream_image_download_failed")
+        except httpx.RequestError as exc:
+            elapsed_ms = int((time.perf_counter() - start) * 1000)
+            print(
+                f"[AI_PROXY_IMAGE_ERROR] request_id={request_id} "
+                f"error_type=upstream_image_download_failed reason=network "
+                f"requested_model={requested_model_log} resolved_model={resolved_model} "
+                f"message={truncate_for_log(str(exc))} elapsed_ms={elapsed_ms}"
+            )
+            raise HTTPException(status_code=502, detail="upstream_image_download_failed")
+
+        if dl.status_code >= 400:
+            elapsed_ms = int((time.perf_counter() - start) * 1000)
+            prev = truncate_for_log(dl.text[:800], max_len=800)
+            print(
+                f"[AI_PROXY_IMAGE_ERROR] request_id={request_id} "
+                f"error_type=upstream_image_download_failed reason=http "
+                f"upstream_status_code={dl.status_code} requested_model={requested_model_log} "
+                f"resolved_model={resolved_model} upstream_body_preview={prev} elapsed_ms={elapsed_ms}"
+            )
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "error": "upstream_image_download_failed",
+                    "status_code": dl.status_code,
+                    "body": dl.text[:800],
+                },
+            )
+
+        raw_bytes = dl.content
+        if len(raw_bytes) > _MAX_IMAGE_DOWNLOAD_BYTES:
+            elapsed_ms = int((time.perf_counter() - start) * 1000)
+            print(
+                f"[AI_PROXY_IMAGE_ERROR] request_id={request_id} "
+                f"error_type=image_too_large requested_model={requested_model_log} "
+                f"resolved_model={resolved_model} elapsed_ms={elapsed_ms}"
+            )
+            raise HTTPException(status_code=502, detail="image_too_large")
+
+        mime_type = _resolve_mime_from_bytes(raw_bytes, dl.headers.get("content-type"))
+        return raw_bytes, mime_type, "url_downloaded"
+
+    elapsed_ms = int((time.perf_counter() - start) * 1000)
+    print(
+        f"[AI_PROXY_IMAGE_ERROR] request_id={request_id} "
+        f"error_type=missing_image_payload requested_model={requested_model_log} "
+        f"resolved_model={resolved_model} elapsed_ms={elapsed_ms}"
+    )
+    raise HTTPException(status_code=502, detail="missing_image_payload")
 
 
 def parse_bearer_token(authorization: str | None) -> str | None:
@@ -361,15 +525,19 @@ async def text_completions(
         raise HTTPException(status_code=500, detail="unexpected_error")
 
 
-@app.post("/images/generations", response_model=ImageGenerationB64Response)
+@app.post(
+    "/images/generations",
+    response_model=Union[ImageGenerationB64Response, ImageGenerationR2UrlResponse],
+)
 async def images_generations(
     body: ImageGenerationRequest,
     authorization: Annotated[str | None, Header(alias="Authorization")] = None,
-) -> ImageGenerationB64Response:
-    """Forward POST /images/generations upstream; always return inline ``data[0].b64_json`` + ``mime_type``.
+) -> Union[ImageGenerationB64Response, ImageGenerationR2UrlResponse]:
+    """Forward POST /images/generations upstream.
 
-    If the upstream returns a temporary ``url`` (common when ``response_format=url``), the proxy fetches
-    the bytes on Railway and base64-encodes them so callers behind restrictive egress never hit xAI URLs.
+    - ``response_format=url|b64_json``: return ``data[0].b64_json`` + ``mime_type`` (URLs fetched on Railway).
+    - ``response_format=r2_url``: ask upstream for ``b64_json``, resolve bytes (download URL if needed),
+      upload to R2, return only ``data[0].url`` + ``mime_type`` + ``storage=r2``.
     """
     request_id = str(uuid.uuid4())
     require_proxy_auth(authorization)
@@ -391,17 +559,19 @@ async def images_generations(
 
     timeout = httpx.Timeout(timeout_seconds)
     fmt = (body.response_format or "url").strip().lower()
-    if fmt not in ("url", "b64_json"):
+    if fmt not in ("url", "b64_json", "r2_url"):
         raise HTTPException(
             status_code=400,
-            detail="response_format must be 'url' or 'b64_json'",
+            detail="response_format must be 'url', 'b64_json', or 'r2_url'",
         )
+
+    upstream_fmt: str = "b64_json" if fmt == "r2_url" else fmt
 
     payload: dict[str, Any] = {
         "model": resolved_model,
         "prompt": body.prompt,
         "n": 1,
-        "response_format": fmt,
+        "response_format": upstream_fmt,
     }
     if body.aspect_ratio:
         payload["aspect_ratio"] = body.aspect_ratio
@@ -418,7 +588,7 @@ async def images_generations(
         f"[AI_PROXY_IMAGE_REQUEST] request_id={request_id} "
         f"requested_model={requested_model_log} resolved_model={resolved_model} "
         f"model_source={model_source_env} provider={provider_label} "
-        f"upstream_url={upstream_url} response_format={fmt} "
+        f"upstream_url={upstream_url} response_format={fmt} upstream_response_format={upstream_fmt} "
         f"project_id={body.project_id} target_type={body.target_type or ''} target_id={body.target_id} "
         f"timeout_seconds={timeout_seconds}"
     )
@@ -473,99 +643,102 @@ async def images_generations(
             if not isinstance(first, dict):
                 raise HTTPException(status_code=502, detail="invalid_upstream_response")
 
-            b64_in = first.get("b64_json")
-            url_in = first.get("url")
+            raw_bytes, mime_type, b64_source = await extract_image_bytes_from_upstream_item(
+                client,
+                first,
+                request_id=request_id,
+                requested_model_log=requested_model_log,
+                resolved_model=resolved_model,
+                start=start,
+            )
 
-            final_b64: str
-            mime_type: str
-            b64_source: str
+            if fmt == "r2_url":
+                r2_endpoint, r2_access, r2_secret, r2_bucket, r2_public = load_r2_settings()
+                if not all((r2_endpoint, r2_access, r2_secret, r2_bucket, r2_public)):
+                    elapsed_ms = int((time.perf_counter() - start) * 1000)
+                    print(
+                        f"[AI_PROXY_IMAGE_ERROR] request_id={request_id} "
+                        f"error_type=r2_not_configured elapsed_ms={elapsed_ms}"
+                    )
+                    raise HTTPException(
+                        status_code=500,
+                        detail="r2_not_configured: set R2_ENDPOINT, R2_ACCESS_KEY, R2_SECRET_KEY, "
+                        "R2_BUCKET_NAME, R2_PUBLIC_BASE_URL",
+                    )
 
-            if isinstance(b64_in, str) and b64_in.strip():
-                final_b64 = b64_in.strip()
+                storage_key = build_r2_image_object_key(
+                    project_id=body.project_id,
+                    target_type=body.target_type,
+                    target_id=body.target_id,
+                    request_id=request_id,
+                    mime_type=mime_type,
+                )
+
+                tt_log = body.target_type or ""
+                pid_log = body.project_id if body.project_id is not None else 0
+                tid_log = body.target_id if body.target_id is not None else 0
+
+                print(
+                    f"[AI_PROXY_IMAGE_R2_UPLOAD_STARTED] request_id={request_id} "
+                    f"project_id={pid_log} target_type={tt_log} target_id={tid_log} "
+                    f"bytes_len={len(raw_bytes)} mime_type={mime_type}"
+                )
+
                 try:
-                    raw_bytes = base64.standard_b64decode(final_b64)
-                except Exception:
-                    elapsed_ms = int((time.perf_counter() - start) * 1000)
-                    print(
-                        f"[AI_PROXY_IMAGE_ERROR] request_id={request_id} "
-                        f"error_type=invalid_b64_json requested_model={requested_model_log} "
-                        f"resolved_model={resolved_model} elapsed_ms={elapsed_ms}"
+                    await asyncio.to_thread(
+                        upload_bytes_to_r2_sync,
+                        object_key=storage_key,
+                        data=raw_bytes,
+                        content_type=mime_type,
                     )
-                    raise HTTPException(status_code=502, detail="invalid_b64_json")
-                mime_type = _resolve_mime_from_bytes(raw_bytes, None)
-                b64_source = "upstream_b64"
-            elif isinstance(url_in, str) and url_in.strip():
-                img_url = url_in.strip()
-                try:
-                    dl = await client.get(img_url, follow_redirects=True)
-                except httpx.TimeoutException:
+                except ClientError as exc:
                     elapsed_ms = int((time.perf_counter() - start) * 1000)
+                    em = truncate_for_log(str(exc))
                     print(
                         f"[AI_PROXY_IMAGE_ERROR] request_id={request_id} "
-                        f"error_type=image_download_timeout requested_model={requested_model_log} "
-                        f"resolved_model={resolved_model} elapsed_ms={elapsed_ms}"
+                        f"error_type=r2_upload_failed requested_model={requested_model_log} "
+                        f"resolved_model={resolved_model} message={em} elapsed_ms={elapsed_ms}"
                     )
-                    raise HTTPException(status_code=504, detail="image_download_timeout")
-                except httpx.RequestError as exc:
+                    raise HTTPException(status_code=502, detail="r2_upload_failed") from exc
+                except Exception as exc:
                     elapsed_ms = int((time.perf_counter() - start) * 1000)
                     print(
                         f"[AI_PROXY_IMAGE_ERROR] request_id={request_id} "
-                        f"error_type=image_download_network requested_model={requested_model_log} "
+                        f"error_type=r2_upload_failed requested_model={requested_model_log} "
                         f"resolved_model={resolved_model} message={truncate_for_log(str(exc))} "
                         f"elapsed_ms={elapsed_ms}"
                     )
-                    raise HTTPException(status_code=502, detail="image_download_network_error")
+                    raise HTTPException(status_code=502, detail="r2_upload_failed") from exc
 
-                if dl.status_code >= 400:
-                    elapsed_ms = int((time.perf_counter() - start) * 1000)
-                    prev = truncate_for_log(dl.text[:800], max_len=800)
-                    print(
-                        f"[AI_PROXY_IMAGE_ERROR] request_id={request_id} "
-                        f"error_type=image_download_http upstream_status_code={dl.status_code} "
-                        f"requested_model={requested_model_log} resolved_model={resolved_model} "
-                        f"upstream_body_preview={prev} elapsed_ms={elapsed_ms}"
-                    )
-                    raise HTTPException(
-                        status_code=502,
-                        detail={
-                            "error": "image_download_upstream_error",
-                            "status_code": dl.status_code,
-                            "body": dl.text[:800],
-                        },
-                    )
+                public_url = f"{r2_public}/{quote(storage_key, safe='/')}"
 
-                raw_bytes = dl.content
-                if len(raw_bytes) > _MAX_IMAGE_DOWNLOAD_BYTES:
-                    elapsed_ms = int((time.perf_counter() - start) * 1000)
-                    print(
-                        f"[AI_PROXY_IMAGE_ERROR] request_id={request_id} "
-                        f"error_type=image_too_large requested_model={requested_model_log} "
-                        f"resolved_model={resolved_model} elapsed_ms={elapsed_ms}"
-                    )
-                    raise HTTPException(status_code=502, detail="image_too_large")
+                print(
+                    f"[AI_PROXY_IMAGE_R2_UPLOAD_SUCCESS] request_id={request_id} "
+                    f"url={public_url} storage_key={storage_key} bytes_len={len(raw_bytes)}"
+                )
 
-                mime_type = _resolve_mime_from_bytes(raw_bytes, dl.headers.get("content-type"))
-                final_b64 = base64.standard_b64encode(raw_bytes).decode("ascii")
-                b64_source = "url_downloaded"
-            else:
                 elapsed_ms = int((time.perf_counter() - start) * 1000)
                 print(
-                    f"[AI_PROXY_IMAGE_ERROR] request_id={request_id} "
-                    f"error_type=missing_image_payload requested_model={requested_model_log} "
-                    f"resolved_model={resolved_model} elapsed_ms={elapsed_ms}"
+                    f"[AI_PROXY_IMAGE_RESPONSE] request_id={request_id} success=true format=r2_url "
+                    f"storage=r2 resolved_model={resolved_model} elapsed_ms={elapsed_ms}"
                 )
-                raise HTTPException(status_code=502, detail="missing_image_payload")
+                return ImageGenerationR2UrlResponse(
+                    data=[ImageGenerationDataUrlItem(url=public_url)],
+                    mime_type=mime_type,
+                    storage="r2",
+                )
 
-        elapsed_ms = int((time.perf_counter() - start) * 1000)
-        print(
-            f"[AI_PROXY_IMAGE_RESPONSE] request_id={request_id} success=true format=b64_json "
-            f"source={b64_source} mime_type={mime_type} resolved_model={resolved_model} "
-            f"elapsed_ms={elapsed_ms}"
-        )
-        return ImageGenerationB64Response(
-            data=[ImageGenerationDataItem(b64_json=final_b64)],
-            mime_type=mime_type,
-        )
+            final_b64 = base64.standard_b64encode(raw_bytes).decode("ascii")
+            elapsed_ms = int((time.perf_counter() - start) * 1000)
+            print(
+                f"[AI_PROXY_IMAGE_RESPONSE] request_id={request_id} success=true format=b64_json "
+                f"source={b64_source} mime_type={mime_type} resolved_model={resolved_model} "
+                f"elapsed_ms={elapsed_ms}"
+            )
+            return ImageGenerationB64Response(
+                data=[ImageGenerationDataItem(b64_json=final_b64)],
+                mime_type=mime_type,
+            )
 
     except HTTPException:
         raise

@@ -28,3 +28,19 @@ def test_resolve_mime_prefers_content_type_image() -> None:
 def test_resolve_mime_sniffs_when_octet_stream() -> None:
     raw = b"\x89PNG\r\n\x1a\n" + b"x" * 8
     assert main._resolve_mime_from_bytes(raw, "application/octet-stream") == "image/png"
+
+
+def test_extension_for_mime() -> None:
+    assert main.extension_for_mime("image/jpeg") == ".jpg"
+    assert main.extension_for_mime("image/png") == ".png"
+
+
+def test_build_r2_image_object_key() -> None:
+    k = main.build_r2_image_object_key(
+        project_id=7,
+        target_type="scene",
+        target_id=99,
+        request_id="abc-uuid",
+        mime_type="image/png",
+    )
+    assert k == "short-drama/assets/7/scene/99/abc-uuid.png"
