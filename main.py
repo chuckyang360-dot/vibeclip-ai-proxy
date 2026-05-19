@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import time
@@ -41,9 +42,18 @@ class ImageGenerationRequest(BaseModel):
     target_id: int | None = None
 
 
-class ImageGenerationResponse(BaseModel):
-    url: str | None = None
-    b64_json: str | None = None
+class ImageGenerationDataItem(BaseModel):
+    b64_json: str
+
+
+class ImageGenerationB64Response(BaseModel):
+    """Caller always receives inline base64 so backends behind restrictive egress need not fetch image URLs."""
+
+    data: list[ImageGenerationDataItem]
+    mime_type: str
+
+
+_MAX_IMAGE_DOWNLOAD_BYTES = 25 * 1024 * 1024
 
 
 def get_env(key: str, default: str | None = None) -> str | None:
@@ -107,6 +117,35 @@ def truncate_for_log(text: str, max_len: int = 500) -> str:
     if len(text) <= max_len:
         return text
     return text[:max_len] + "...(truncated)"
+
+
+def _mime_from_content_type(content_type: str | None) -> str | None:
+    if not content_type or not str(content_type).strip():
+        return None
+    main = str(content_type).split(";")[0].strip().lower()
+    return main if main else None
+
+
+def sniff_image_mime(data: bytes) -> str:
+    if len(data) >= 8 and data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if len(data) >= 3 and data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "image/webp"
+    if len(data) >= 6 and (data.startswith(b"GIF87a") or data.startswith(b"GIF89a")):
+        return "image/gif"
+    return "application/octet-stream"
+
+
+def _resolve_mime_from_bytes(raw: bytes, content_type: str | None) -> str:
+    ct = _mime_from_content_type(content_type)
+    if ct and ct.startswith("image/"):
+        return ct
+    sniffed = sniff_image_mime(raw)
+    if sniffed != "application/octet-stream":
+        return sniffed
+    return ct or "image/png"
 
 
 def parse_bearer_token(authorization: str | None) -> str | None:
@@ -322,12 +361,16 @@ async def text_completions(
         raise HTTPException(status_code=500, detail="unexpected_error")
 
 
-@app.post("/images/generations", response_model=ImageGenerationResponse)
+@app.post("/images/generations", response_model=ImageGenerationB64Response)
 async def images_generations(
     body: ImageGenerationRequest,
     authorization: Annotated[str | None, Header(alias="Authorization")] = None,
-) -> ImageGenerationResponse:
-    """OpenAI-compatible POST /images/generations via Railway (xAI grok-imagine-image, etc.)."""
+) -> ImageGenerationB64Response:
+    """Forward POST /images/generations upstream; always return inline ``data[0].b64_json`` + ``mime_type``.
+
+    If the upstream returns a temporary ``url`` (common when ``response_format=url``), the proxy fetches
+    the bytes on Railway and base64-encodes them so callers behind restrictive egress never hit xAI URLs.
+    """
     request_id = str(uuid.uuid4())
     require_proxy_auth(authorization)
 
@@ -348,6 +391,12 @@ async def images_generations(
 
     timeout = httpx.Timeout(timeout_seconds)
     fmt = (body.response_format or "url").strip().lower()
+    if fmt not in ("url", "b64_json"):
+        raise HTTPException(
+            status_code=400,
+            detail="response_format must be 'url' or 'b64_json'",
+        )
+
     payload: dict[str, Any] = {
         "model": resolved_model,
         "prompt": body.prompt,
@@ -380,68 +429,143 @@ async def images_generations(
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(upstream_url, headers=headers, json=payload)
 
+            if resp.status_code >= 400:
+                elapsed_ms = int((time.perf_counter() - start) * 1000)
+                body_preview = truncate_for_log(resp.text[:800], max_len=800)
+                print(
+                    f"[AI_PROXY_IMAGE_ERROR] request_id={request_id} "
+                    f"error_type=upstream_http upstream_status_code={resp.status_code} "
+                    f"requested_model={requested_model_log} resolved_model={resolved_model} "
+                    f"upstream_body_preview={body_preview} elapsed_ms={elapsed_ms}"
+                )
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "error": "upstream_error",
+                        "status_code": resp.status_code,
+                        "body": resp.text[:800],
+                    },
+                )
+
+            try:
+                data = resp.json()
+            except json.JSONDecodeError as exc:
+                elapsed_ms = int((time.perf_counter() - start) * 1000)
+                print(
+                    f"[AI_PROXY_IMAGE_ERROR] request_id={request_id} "
+                    f"error_type=json_decode_error requested_model={requested_model_log} "
+                    f"resolved_model={resolved_model} message={truncate_for_log(str(exc))} "
+                    f"elapsed_ms={elapsed_ms}"
+                )
+                raise HTTPException(status_code=500, detail="unexpected_error")
+
+            items = data.get("data")
+            if not isinstance(items, list) or not items:
+                elapsed_ms = int((time.perf_counter() - start) * 1000)
+                print(
+                    f"[AI_PROXY_IMAGE_ERROR] request_id={request_id} "
+                    f"error_type=invalid_upstream_response requested_model={requested_model_log} "
+                    f"resolved_model={resolved_model} message=missing_data_array elapsed_ms={elapsed_ms}"
+                )
+                raise HTTPException(status_code=502, detail="invalid_upstream_response")
+
+            first = items[0]
+            if not isinstance(first, dict):
+                raise HTTPException(status_code=502, detail="invalid_upstream_response")
+
+            b64_in = first.get("b64_json")
+            url_in = first.get("url")
+
+            final_b64: str
+            mime_type: str
+            b64_source: str
+
+            if isinstance(b64_in, str) and b64_in.strip():
+                final_b64 = b64_in.strip()
+                try:
+                    raw_bytes = base64.standard_b64decode(final_b64)
+                except Exception:
+                    elapsed_ms = int((time.perf_counter() - start) * 1000)
+                    print(
+                        f"[AI_PROXY_IMAGE_ERROR] request_id={request_id} "
+                        f"error_type=invalid_b64_json requested_model={requested_model_log} "
+                        f"resolved_model={resolved_model} elapsed_ms={elapsed_ms}"
+                    )
+                    raise HTTPException(status_code=502, detail="invalid_b64_json")
+                mime_type = _resolve_mime_from_bytes(raw_bytes, None)
+                b64_source = "upstream_b64"
+            elif isinstance(url_in, str) and url_in.strip():
+                img_url = url_in.strip()
+                try:
+                    dl = await client.get(img_url, follow_redirects=True)
+                except httpx.TimeoutException:
+                    elapsed_ms = int((time.perf_counter() - start) * 1000)
+                    print(
+                        f"[AI_PROXY_IMAGE_ERROR] request_id={request_id} "
+                        f"error_type=image_download_timeout requested_model={requested_model_log} "
+                        f"resolved_model={resolved_model} elapsed_ms={elapsed_ms}"
+                    )
+                    raise HTTPException(status_code=504, detail="image_download_timeout")
+                except httpx.RequestError as exc:
+                    elapsed_ms = int((time.perf_counter() - start) * 1000)
+                    print(
+                        f"[AI_PROXY_IMAGE_ERROR] request_id={request_id} "
+                        f"error_type=image_download_network requested_model={requested_model_log} "
+                        f"resolved_model={resolved_model} message={truncate_for_log(str(exc))} "
+                        f"elapsed_ms={elapsed_ms}"
+                    )
+                    raise HTTPException(status_code=502, detail="image_download_network_error")
+
+                if dl.status_code >= 400:
+                    elapsed_ms = int((time.perf_counter() - start) * 1000)
+                    prev = truncate_for_log(dl.text[:800], max_len=800)
+                    print(
+                        f"[AI_PROXY_IMAGE_ERROR] request_id={request_id} "
+                        f"error_type=image_download_http upstream_status_code={dl.status_code} "
+                        f"requested_model={requested_model_log} resolved_model={resolved_model} "
+                        f"upstream_body_preview={prev} elapsed_ms={elapsed_ms}"
+                    )
+                    raise HTTPException(
+                        status_code=502,
+                        detail={
+                            "error": "image_download_upstream_error",
+                            "status_code": dl.status_code,
+                            "body": dl.text[:800],
+                        },
+                    )
+
+                raw_bytes = dl.content
+                if len(raw_bytes) > _MAX_IMAGE_DOWNLOAD_BYTES:
+                    elapsed_ms = int((time.perf_counter() - start) * 1000)
+                    print(
+                        f"[AI_PROXY_IMAGE_ERROR] request_id={request_id} "
+                        f"error_type=image_too_large requested_model={requested_model_log} "
+                        f"resolved_model={resolved_model} elapsed_ms={elapsed_ms}"
+                    )
+                    raise HTTPException(status_code=502, detail="image_too_large")
+
+                mime_type = _resolve_mime_from_bytes(raw_bytes, dl.headers.get("content-type"))
+                final_b64 = base64.standard_b64encode(raw_bytes).decode("ascii")
+                b64_source = "url_downloaded"
+            else:
+                elapsed_ms = int((time.perf_counter() - start) * 1000)
+                print(
+                    f"[AI_PROXY_IMAGE_ERROR] request_id={request_id} "
+                    f"error_type=missing_image_payload requested_model={requested_model_log} "
+                    f"resolved_model={resolved_model} elapsed_ms={elapsed_ms}"
+                )
+                raise HTTPException(status_code=502, detail="missing_image_payload")
+
         elapsed_ms = int((time.perf_counter() - start) * 1000)
-
-        if resp.status_code >= 400:
-            body_preview = truncate_for_log(resp.text[:800], max_len=800)
-            print(
-                f"[AI_PROXY_IMAGE_ERROR] request_id={request_id} "
-                f"error_type=upstream_http upstream_status_code={resp.status_code} "
-                f"requested_model={requested_model_log} resolved_model={resolved_model} "
-                f"upstream_body_preview={body_preview} elapsed_ms={elapsed_ms}"
-            )
-            raise HTTPException(
-                status_code=502,
-                detail={
-                    "error": "upstream_error",
-                    "status_code": resp.status_code,
-                    "body": resp.text[:800],
-                },
-            )
-
-        try:
-            data = resp.json()
-        except json.JSONDecodeError as exc:
-            print(
-                f"[AI_PROXY_IMAGE_ERROR] request_id={request_id} "
-                f"error_type=json_decode_error requested_model={requested_model_log} "
-                f"resolved_model={resolved_model} message={truncate_for_log(str(exc))} "
-                f"elapsed_ms={elapsed_ms}"
-            )
-            raise HTTPException(status_code=500, detail="unexpected_error")
-
-        items = data.get("data")
-        if not isinstance(items, list) or not items:
-            print(
-                f"[AI_PROXY_IMAGE_ERROR] request_id={request_id} "
-                f"error_type=invalid_upstream_response requested_model={requested_model_log} "
-                f"resolved_model={resolved_model} message=missing_data_array elapsed_ms={elapsed_ms}"
-            )
-            raise HTTPException(status_code=502, detail="invalid_upstream_response")
-
-        first = items[0]
-        if not isinstance(first, dict):
-            raise HTTPException(status_code=502, detail="invalid_upstream_response")
-
-        if fmt == "b64_json":
-            b64 = first.get("b64_json")
-            if not isinstance(b64, str) or not b64.strip():
-                raise HTTPException(status_code=502, detail="missing_b64_json")
-            print(
-                f"[AI_PROXY_IMAGE_RESPONSE] request_id={request_id} success=true format=b64_json "
-                f"resolved_model={resolved_model} elapsed_ms={elapsed_ms}"
-            )
-            return ImageGenerationResponse(b64_json=b64.strip())
-
-        url = first.get("url")
-        if not isinstance(url, str) or not url.strip():
-            raise HTTPException(status_code=502, detail="missing_image_url")
-
         print(
-            f"[AI_PROXY_IMAGE_RESPONSE] request_id={request_id} success=true format=url "
-            f"resolved_model={resolved_model} elapsed_ms={elapsed_ms}"
+            f"[AI_PROXY_IMAGE_RESPONSE] request_id={request_id} success=true format=b64_json "
+            f"source={b64_source} mime_type={mime_type} resolved_model={resolved_model} "
+            f"elapsed_ms={elapsed_ms}"
         )
-        return ImageGenerationResponse(url=url.strip())
+        return ImageGenerationB64Response(
+            data=[ImageGenerationDataItem(b64_json=final_b64)],
+            mime_type=mime_type,
+        )
 
     except HTTPException:
         raise
