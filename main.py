@@ -32,6 +32,7 @@ class S1VisionResponse(BaseModel):
 
 class ImageGenerationRequest(BaseModel):
     prompt: str
+    model: str | None = Field(default=None, description="Image model id; when set, forwarded upstream as-is")
     response_format: str = Field(default="url", description="url | b64_json")
     aspect_ratio: str | None = None
     resolution: str | None = None
@@ -79,9 +80,23 @@ def resolve_text_chat_model() -> tuple[str, str]:
     return "", ""
 
 
-def resolve_image_generation_model() -> tuple[str, str]:
-    """S3 asset images: prefer dedicated image model env, then shared XAI_MODEL."""
-    for key in ("XAI_IMAGE_MODEL", "SHORT_DRAMA_XAI_IMAGE_MODEL", "XAI_MODEL", "OPENAI_MODEL"):
+def resolve_image_generation_model(body_model: str | None) -> tuple[str, str]:
+    """Pick upstream image model for /images/generations.
+
+    Priority:
+      1. Request body ``model`` (non-empty)
+      2. XAI_IMAGE_MODEL
+      3. SHORT_DRAMA_XAI_IMAGE_MODEL (legacy alias)
+      4. IMAGE_MODEL
+      5. grok-imagine-image
+
+    Never uses XAI_MODEL / OPENAI_MODEL (those are text/chat defaults).
+    """
+    if body_model is not None:
+        m = str(body_model).strip()
+        if m:
+            return m, "request_body"
+    for key in ("XAI_IMAGE_MODEL", "SHORT_DRAMA_XAI_IMAGE_MODEL", "IMAGE_MODEL"):
         v = get_env(key)
         if v:
             return v.strip(), key
@@ -321,7 +336,9 @@ async def images_generations(
         raise HTTPException(status_code=500, detail="openai_api_key_not_configured")
 
     base_url = get_env("OPENAI_BASE_URL", "https://api.openai.com/v1") or "https://api.openai.com/v1"
-    model, model_source_env = resolve_image_generation_model()
+    requested_raw = (body.model or "").strip() if body.model is not None else ""
+    requested_model_log = requested_raw if requested_raw else "(none)"
+    resolved_model, model_source_env = resolve_image_generation_model(body.model)
     provider_label = infer_upstream_provider_label(base_url)
     timeout_raw = get_env("REQUEST_TIMEOUT_SECONDS", "120") or "120"
     try:
@@ -332,7 +349,7 @@ async def images_generations(
     timeout = httpx.Timeout(timeout_seconds)
     fmt = (body.response_format or "url").strip().lower()
     payload: dict[str, Any] = {
-        "model": model,
+        "model": resolved_model,
         "prompt": body.prompt,
         "n": 1,
         "response_format": fmt,
@@ -350,9 +367,11 @@ async def images_generations(
 
     print(
         f"[AI_PROXY_IMAGE_REQUEST] request_id={request_id} "
-        f"provider={provider_label} base_url={base_url} model={model} model_env={model_source_env} "
+        f"requested_model={requested_model_log} resolved_model={resolved_model} "
+        f"model_source={model_source_env} provider={provider_label} "
+        f"upstream_url={upstream_url} response_format={fmt} "
         f"project_id={body.project_id} target_type={body.target_type or ''} target_id={body.target_id} "
-        f"response_format={fmt} timeout_seconds={timeout_seconds}"
+        f"timeout_seconds={timeout_seconds}"
     )
 
     start = time.perf_counter()
@@ -367,8 +386,9 @@ async def images_generations(
             body_preview = truncate_for_log(resp.text[:800], max_len=800)
             print(
                 f"[AI_PROXY_IMAGE_ERROR] request_id={request_id} "
-                f"error_type=upstream_http status_code={resp.status_code} "
-                f"message={body_preview} elapsed_ms={elapsed_ms}"
+                f"error_type=upstream_http upstream_status_code={resp.status_code} "
+                f"requested_model={requested_model_log} resolved_model={resolved_model} "
+                f"upstream_body_preview={body_preview} elapsed_ms={elapsed_ms}"
             )
             raise HTTPException(
                 status_code=502,
@@ -384,7 +404,8 @@ async def images_generations(
         except json.JSONDecodeError as exc:
             print(
                 f"[AI_PROXY_IMAGE_ERROR] request_id={request_id} "
-                f"error_type=json_decode_error message={truncate_for_log(str(exc))} "
+                f"error_type=json_decode_error requested_model={requested_model_log} "
+                f"resolved_model={resolved_model} message={truncate_for_log(str(exc))} "
                 f"elapsed_ms={elapsed_ms}"
             )
             raise HTTPException(status_code=500, detail="unexpected_error")
@@ -393,7 +414,8 @@ async def images_generations(
         if not isinstance(items, list) or not items:
             print(
                 f"[AI_PROXY_IMAGE_ERROR] request_id={request_id} "
-                f"error_type=invalid_upstream_response message=missing data[] elapsed_ms={elapsed_ms}"
+                f"error_type=invalid_upstream_response requested_model={requested_model_log} "
+                f"resolved_model={resolved_model} message=missing_data_array elapsed_ms={elapsed_ms}"
             )
             raise HTTPException(status_code=502, detail="invalid_upstream_response")
 
@@ -407,7 +429,7 @@ async def images_generations(
                 raise HTTPException(status_code=502, detail="missing_b64_json")
             print(
                 f"[AI_PROXY_IMAGE_RESPONSE] request_id={request_id} success=true format=b64_json "
-                f"elapsed_ms={elapsed_ms}"
+                f"resolved_model={resolved_model} elapsed_ms={elapsed_ms}"
             )
             return ImageGenerationResponse(b64_json=b64.strip())
 
@@ -417,7 +439,7 @@ async def images_generations(
 
         print(
             f"[AI_PROXY_IMAGE_RESPONSE] request_id={request_id} success=true format=url "
-            f"elapsed_ms={elapsed_ms}"
+            f"resolved_model={resolved_model} elapsed_ms={elapsed_ms}"
         )
         return ImageGenerationResponse(url=url.strip())
 
@@ -428,7 +450,8 @@ async def images_generations(
         elapsed_ms = int((time.perf_counter() - start) * 1000)
         print(
             f"[AI_PROXY_IMAGE_ERROR] request_id={request_id} "
-            f"error_type=upstream_timeout elapsed_ms={elapsed_ms}"
+            f"error_type=upstream_timeout requested_model={requested_model_log} "
+            f"resolved_model={resolved_model} elapsed_ms={elapsed_ms}"
         )
         raise HTTPException(status_code=504, detail="upstream_timeout")
 
@@ -436,7 +459,8 @@ async def images_generations(
         elapsed_ms = int((time.perf_counter() - start) * 1000)
         print(
             f"[AI_PROXY_IMAGE_ERROR] request_id={request_id} "
-            f"error_type=network_connect_error message={truncate_for_log(str(exc))} elapsed_ms={elapsed_ms}"
+            f"error_type=network_connect_error requested_model={requested_model_log} "
+            f"resolved_model={resolved_model} message={truncate_for_log(str(exc))} elapsed_ms={elapsed_ms}"
         )
         raise HTTPException(status_code=502, detail="network_connect_error")
 
@@ -444,7 +468,8 @@ async def images_generations(
         elapsed_ms = int((time.perf_counter() - start) * 1000)
         print(
             f"[AI_PROXY_IMAGE_ERROR] request_id={request_id} "
-            f"error_type=network_connect_error message={truncate_for_log(str(exc))} elapsed_ms={elapsed_ms}"
+            f"error_type=network_connect_error requested_model={requested_model_log} "
+            f"resolved_model={resolved_model} message={truncate_for_log(str(exc))} elapsed_ms={elapsed_ms}"
         )
         raise HTTPException(status_code=502, detail="network_connect_error")
 
@@ -452,7 +477,8 @@ async def images_generations(
         elapsed_ms = int((time.perf_counter() - start) * 1000)
         print(
             f"[AI_PROXY_IMAGE_ERROR] request_id={request_id} "
-            f"error_type=unexpected_error message={truncate_for_log(str(exc))} elapsed_ms={elapsed_ms}"
+            f"error_type=unexpected_error requested_model={requested_model_log} "
+            f"resolved_model={resolved_model} message={truncate_for_log(str(exc))} elapsed_ms={elapsed_ms}"
         )
         raise HTTPException(status_code=500, detail="unexpected_error")
 

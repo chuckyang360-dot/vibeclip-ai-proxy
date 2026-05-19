@@ -13,7 +13,7 @@
 - `GET /health`：健康检查。
 - `POST /s1/vision`：S1 产品图片理解；校验内部 Token；将图片 URL、`system_prompt`、`user_payload` 发往 OpenAI-compatible `chat/completions`；返回 `choices[0].message.content` 作为 `raw_text`。
 - `POST /text/completions`：通用文本（及可选 `image_urls` 多模态）`chat/completions` 代理。用于阿里云后端在 `AI_PROVIDER=railway_proxy` 时生成 **creative_brief**、S2 等结构化 JSON（请求体为 `system_prompt` + `user_text`）；返回同样为 `{"raw_text": "..."}`。
-- `POST /images/generations`：S3 资产文生图；转发 OpenAI-compatible `POST /images/generations`（如 xAI `grok-imagine-image`）；返回 `{"url": "..."}` 或 `{"b64_json": "..."}`。
+- `POST /images/generations`：S3 资产文生图；转发 OpenAI-compatible `POST /images/generations`（如 xAI `grok-imagine-image`）；返回 `{"url": "..."}` 或 `{"b64_json": "..."}`。上游 **`model`** 优先使用请求体里的 `model`，否则依次使用 **`XAI_IMAGE_MODEL` → `SHORT_DRAMA_XAI_IMAGE_MODEL` → `IMAGE_MODEL`**，最后默认 `grok-imagine-image`；**不会**使用 `XAI_MODEL`，避免把文本模型误发到图片接口。
 
 不包含数据库、前端、通用 AI 网关、S4 视频、S5、**业务** JSON 解析或业务规则（后端仍负责 `raw_text` → JSON 解析与 schema；本服务只做鉴权 + 上游转发）。
 
@@ -39,11 +39,13 @@
 | `OPENAI_BASE_URL` | OpenAI 兼容 API 根路径，默认 `https://api.openai.com/v1`（xAI 时多为 `https://api.x.ai/v1`） |
 | `S1_VISION_MODEL` | （可选）仅覆盖 S1 视觉所用模型名；未设置则按顺序尝试 `XAI_MODEL`、`OPENAI_MODEL` |
 | `XAI_TEXT_MODEL` | （可选）优先用于 **`/text/completions`**；未设置则用 `XAI_MODEL` |
-| `XAI_MODEL` | （可选）文本与 S1 视觉的后备共用 |
+| `XAI_MODEL` | （可选）文本 chat、S1 视觉等后备（**不用于** `/images/generations`） |
+| `XAI_IMAGE_MODEL` | （可选）图片 `/images/generations` 默认模型；优先级低于请求体 `model` |
+| `IMAGE_MODEL` | （可选）图片接口第三顺位后备（在 `SHORT_DRAMA_XAI_IMAGE_MODEL` 之后） |
 | `OPENAI_MODEL` | （可选）官方 OpenAI 等场景的模型名后备 |
 | `REQUEST_TIMEOUT_SECONDS` | 上游请求超时（秒），默认 `120` |
 
-**模型**：`/s1/vision` 须配置 `S1_VISION_MODEL`、`XAI_MODEL`、`OPENAI_MODEL` 之一；**`/text/completions`** 须配置 `XAI_TEXT_MODEL`、`XAI_MODEL`、`OPENAI_MODEL` 之一。若你在 Railway 只设了 `XAI_MODEL`，两条路由都会使用该值。
+**模型**：`/s1/vision` 须配置 `S1_VISION_MODEL`、`XAI_MODEL`、`OPENAI_MODEL` 之一；**`/text/completions`** 须配置 `XAI_TEXT_MODEL`、`XAI_MODEL`、`OPENAI_MODEL` 之一。**`/images/generations`** 使用请求体 `model` 或 `XAI_IMAGE_MODEL` 等图片专用变量，与 `XAI_MODEL` 分离，避免 grok-4.20 误走图片端点。
 
 参考 `.env.example` 填写本地或 Railway 变量。
 
