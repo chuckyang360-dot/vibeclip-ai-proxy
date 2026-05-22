@@ -14,8 +14,9 @@
 - `POST /s1/vision`：S1 产品图片理解；校验内部 Token；将图片 URL、`system_prompt`、`user_payload` 发往 OpenAI-compatible `chat/completions`；返回 `choices[0].message.content` 作为 `raw_text`。
 - `POST /text/completions`：通用文本（及可选 `image_urls` 多模态）`chat/completions` 代理。用于阿里云后端在 `AI_PROVIDER=railway_proxy` 时生成 **creative_brief**、S2 等结构化 JSON（请求体为 `system_prompt` + `user_text`）；返回同样为 `{"raw_text": "..."}`。
 - `POST /images/generations`：S3 资产文生图；转发上游 `POST /images/generations`。`response_format` 可选 **`url` \| `b64_json` \| `r2_url`**：
-  - **`url` / `b64_json`**：成功响应为 `{"data": [{"b64_json": "<base64>"}], "mime_type": "..."}`（上游若只给临时 URL，由 Railway 下载后再 base64；日志 `source=upstream_b64` / `url_downloaded`）。
-  - **`r2_url`（推荐阿里云后端）**：上游按 `b64_json` 拉取图片字节（若仅有 URL 仍会下载），写入 **Cloudflare R2** 后返回轻量 **`{"data": [{"url": "<R2 公网 URL>"}], "mime_type": "...", "storage": "r2"}`**，避免超大 JSON 导致大陆后端读响应超时。须配置 **`R2_*`** 环境变量。
+  - **`url`**：上游 `response_format=url`，成功响应为 `{"url": "<upstream image URL>"}`。
+  - **`b64_json`**：上游 `response_format=b64_json`，成功响应为 `{"b64_json": "<base64>"}`。
+  - **`r2_url`（推荐阿里云后端）**：客户端目标格式为 `r2_url`，但上游只会收到 `url` 或 `b64_json`，不会收到 `r2_url`。默认上游 `response_format=url`；如需上游直接返回 base64，可设置 `AI_PROXY_IMAGE_UPSTREAM_FORMAT_FOR_R2=b64_json`。Railway 获取图片字节后写入 **Cloudflare R2**，返回轻量 **`{"url": "<R2 公网 URL>", "image_url": "<R2 公网 URL>", "storage": "r2", "response_format": "r2_url"}`**。须配置 **`R2_*`** 环境变量。
 
 不包含数据库、前端、通用 AI 网关、S4 视频、S5、**业务** JSON 解析或业务规则（后端仍负责 `raw_text` → JSON 解析与 schema；本服务只做鉴权 + 上游转发）。
 
@@ -46,6 +47,7 @@
 | `IMAGE_MODEL` | （可选）图片接口第三顺位后备（在 `SHORT_DRAMA_XAI_IMAGE_MODEL` 之后） |
 | `OPENAI_MODEL` | （可选）官方 OpenAI 等场景的模型名后备 |
 | `REQUEST_TIMEOUT_SECONDS` | 上游请求超时（秒），默认 `120` |
+| `AI_PROXY_IMAGE_UPSTREAM_FORMAT_FOR_R2` | （可选）客户端 `response_format=r2_url` 时传给上游的格式；允许 `url` 或 `b64_json`，默认 `url` |
 | `R2_ENDPOINT` | （**`response_format=r2_url` 必填**）R2 S3 API Endpoint |
 | `R2_ACCESS_KEY` | （同上）R2 Access Key |
 | `R2_SECRET_KEY` | （同上）R2 Secret Key |

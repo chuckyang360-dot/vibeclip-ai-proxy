@@ -30,17 +30,19 @@ def test_resolve_mime_sniffs_when_octet_stream() -> None:
     assert main._resolve_mime_from_bytes(raw, "application/octet-stream") == "image/png"
 
 
-def test_extension_for_mime() -> None:
-    assert main.extension_for_mime("image/jpeg") == ".jpg"
-    assert main.extension_for_mime("image/png") == ".png"
+def test_extension_for_mime_image() -> None:
+    assert main.extension_for_mime_image("image/jpeg") == ".jpg"
+    assert main.extension_for_mime_image("image/png") == ".png"
+    assert main.extension_for_mime_image("image/webp") == ".webp"
+    assert main.extension_for_mime_image("application/octet-stream") == ".bin"
 
 
-def test_build_r2_image_object_key() -> None:
-    k = main.build_r2_image_object_key(
+def test_build_image_r2_object_key() -> None:
+    k = main.build_image_r2_object_key(
         project_id=7,
         target_type="scene",
         target_id=99,
-        request_id="abc-uuid",
+        proxy_request_id="abc-uuid",
         mime_type="image/png",
     )
     assert k == "short-drama/assets/7/scene/99/abc-uuid.png"

@@ -190,14 +190,14 @@ def _resolve_mime_from_bytes(raw: bytes, content_type: str | None) -> str:
     return ct or "image/png"
 
 
-def resolve_upstream_image_response_format(client_fmt: str) -> str:
-    """Map client response_format to what OpenAI-compatible image APIs accept upstream."""
-    if client_fmt == "r2_url":
+def resolve_upstream_image_response_format(client_response_format: str) -> str:
+    """Map client response_format to what OpenAI-compatible image APIs accept upstream (url | b64_json only)."""
+    if client_response_format == "r2_url":
         raw = (get_env("AI_PROXY_IMAGE_UPSTREAM_FORMAT_FOR_R2") or "url").strip().lower()
         if raw in ("url", "b64_json"):
             return raw
         return "url"
-    return client_fmt
+    return client_response_format
 
 
 def extension_for_mime_image(mime_type: str) -> str:
@@ -538,6 +538,29 @@ async def images_generations(
 
     wants_r2 = client_fmt == "r2_url"
     upstream_fmt = resolve_upstream_image_response_format(client_fmt)
+    target_response_format = client_fmt
+
+    print(
+        f"[IMAGE_RESPONSE_FORMAT_RESOLVED] "
+        f"client_response_format={client_fmt} "
+        f"upstream_response_format={upstream_fmt} "
+        f"target_response_format={target_response_format} "
+        f"project_id={body.project_id} "
+        f"target_type={body.target_type or ''} "
+        f"target_id={body.target_id}"
+    )
+
+    if upstream_fmt == "r2_url":
+        print(
+            f"[AI_PROXY_IMAGE_ERROR] request_id={request_id} "
+            f"error_type=upstream_format_invariant_violation "
+            f"message={truncate_for_log('upstream_response_format must be url or b64_json, never r2_url')}"
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="internal_error: upstream_response_format_invariant_violation",
+        )
+
     storage_target = "r2" if wants_r2 else "direct"
 
     payload: dict[str, Any] = {
@@ -572,6 +595,11 @@ async def images_generations(
 
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
+            print(
+                f"[UPSTREAM_IMAGE_REQUEST_FORMAT] "
+                f"upstream_response_format={upstream_fmt} "
+                f"model={resolved_model}"
+            )
             resp = await client.post(upstream_url, headers=headers, json=payload)
 
             if resp.status_code >= 400:

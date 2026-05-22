@@ -139,3 +139,77 @@ def test_invalid_client_response_format(image_client: TestClient) -> None:
         json={"prompt": "x", "response_format": "r2_url_typo"},
     )
     assert r.status_code == 400
+
+
+def test_client_url_upstream_payload_is_url(image_client: TestClient) -> None:
+    posted: list[dict | None] = []
+
+    async def fake_post(url: str, **kwargs: object) -> MagicMock:
+        posted.append(kwargs.get("json"))  # type: ignore[assignment]
+        mr = MagicMock()
+        mr.status_code = 200
+        mr.json.return_value = {"data": [{"url": "https://cdn.example/out.png"}]}
+        return mr
+
+    with patch.object(main.httpx, "AsyncClient") as ac_cls:
+        inst = AsyncMock()
+        ac_cls.return_value.__aenter__.return_value = inst
+        inst.post = AsyncMock(side_effect=fake_post)
+
+        r = image_client.post(
+            "/images/generations",
+            headers={"Authorization": "Bearer proxy-token"},
+            json={"prompt": "sky", "response_format": "url"},
+        )
+
+    assert r.status_code == 200, r.text
+    assert posted[0]["response_format"] == "url"
+    assert r.json()["url"] == "https://cdn.example/out.png"
+
+
+def test_client_b64_json_upstream_payload_is_b64_json(image_client: TestClient) -> None:
+    posted: list[dict | None] = []
+    b64 = base64.b64encode(b"\xff\xd8\xff\xe0\x00\x10JFIF").decode("ascii")
+
+    async def fake_post(url: str, **kwargs: object) -> MagicMock:
+        posted.append(kwargs.get("json"))  # type: ignore[assignment]
+        mr = MagicMock()
+        mr.status_code = 200
+        mr.json.return_value = {"data": [{"b64_json": b64}]}
+        return mr
+
+    with patch.object(main.httpx, "AsyncClient") as ac_cls:
+        inst = AsyncMock()
+        ac_cls.return_value.__aenter__.return_value = inst
+        inst.post = AsyncMock(side_effect=fake_post)
+
+        r = image_client.post(
+            "/images/generations",
+            headers={"Authorization": "Bearer proxy-token"},
+            json={"prompt": "sky", "response_format": "b64_json"},
+        )
+
+    assert r.status_code == 200, r.text
+    assert posted[0]["response_format"] == "b64_json"
+    assert r.json()["b64_json"] == b64
+
+
+def test_upstream_r2_url_invariant_blocks_before_post(
+    monkeypatch: pytest.MonkeyPatch,
+    image_client: TestClient,
+) -> None:
+    monkeypatch.setattr(main, "resolve_upstream_image_response_format", lambda _fmt: "r2_url")
+
+    with patch.object(main.httpx, "AsyncClient") as ac_cls:
+        inst = AsyncMock()
+        ac_cls.return_value.__aenter__.return_value = inst
+        inst.post = AsyncMock()
+
+        r = image_client.post(
+            "/images/generations",
+            headers={"Authorization": "Bearer proxy-token"},
+            json={"prompt": "x", "response_format": "url"},
+        )
+
+    assert r.status_code == 500
+    inst.post.assert_not_called()
