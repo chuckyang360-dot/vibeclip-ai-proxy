@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from r2_upload import load_r2_settings, upload_bytes_to_r2
 from xai_video_upstream import generate_xai_video_sync
+from gemini_veo_upstream import generate_gemini_veo_video_sync
 
 app = FastAPI()
 
@@ -88,6 +89,7 @@ class XaiVideoGenerationResponse(BaseModel):
     request_id: str = ""
     video_url: str | None = None
     xai_video_url: str | None = None
+    gemini_video_uri: str | None = None
     storage: str | None = None
     r2_key: str | None = None
     duration_seconds: int | None = None
@@ -329,6 +331,26 @@ async def xai_videos_generations(
     """Aliyun backend → Railway → xAI video (submit + poll); returns public video_url."""
     require_proxy_auth(authorization)
     result = generate_xai_video_sync(
+        project_id=body.project_id,
+        segment_id=body.segment_id,
+        prompt=body.prompt,
+        reference_image_urls=body.reference_image_urls,
+        duration_seconds=body.duration_seconds,
+        aspect_ratio=body.aspect_ratio,
+        resolution=body.resolution,
+        model=body.model,
+    )
+    return XaiVideoGenerationResponse(**result)
+
+
+@app.post("/api/gemini/videos/generations", response_model=XaiVideoGenerationResponse)
+async def gemini_videos_generations(
+    body: XaiVideoGenerationRequest,
+    authorization: Annotated[str | None, Header(alias="Authorization")] = None,
+) -> XaiVideoGenerationResponse:
+    """Aliyun backend -> Railway -> Google Gemini Veo video; returns public R2 video_url."""
+    require_proxy_auth(authorization)
+    result = generate_gemini_veo_video_sync(
         project_id=body.project_id,
         segment_id=body.segment_id,
         prompt=body.prompt,
