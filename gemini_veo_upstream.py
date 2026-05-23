@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import base64
 import time
 from typing import Any
 from urllib.parse import quote
@@ -77,6 +78,19 @@ def _truncate(text: str, limit: int = 1000) -> str:
     return text[:limit] + "..."
 
 
+def _image_mime_from_response(raw: bytes, content_type: str | None) -> str:
+    ct = (content_type or "").split(";", 1)[0].strip().lower()
+    if ct.startswith("image/"):
+        return ct
+    if raw.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/jpeg"
+
+
 def _log_gemini_failure(
     *,
     project_id: int,
@@ -108,15 +122,18 @@ def sanitize_segment_id_for_r2(segment_id: str) -> str:
 def build_gemini_veo_payload(
     *,
     prompt: str,
-    reference_image_urls: list[str],
+    inline_reference_images: list[dict[str, str]] | None = None,
     aspect_ratio: str,
     duration_seconds: int,
     resolution: str | None,
 ) -> dict[str, Any]:
     instance: dict[str, Any] = {"prompt": (prompt or "").strip()}
-    refs = [{"image": {"url": u}} for u in reference_image_urls if (u or "").strip()]
+    refs = list(inline_reference_images or [])
     if refs:
-        instance["referenceImages"] = refs[:3]
+        # Veo REST rejects referenceImages[].image.url for this model. Send the
+        # first reference as inline image bytes, which is the supported
+        # image-to-video shape for predictLongRunning.
+        instance["image"] = refs[0]
     parameters: dict[str, Any] = {
         "aspectRatio": (aspect_ratio or "9:16").strip(),
         "durationSeconds": int(duration_seconds),
@@ -124,6 +141,76 @@ def build_gemini_veo_payload(
     if resolution:
         parameters["resolution"] = str(resolution).strip()
     return {"instances": [instance], "parameters": parameters}
+
+
+def download_gemini_reference_images(
+    *,
+    project_id: int,
+    segment_id: str,
+    reference_image_urls: list[str],
+    timeout: httpx.Timeout,
+) -> tuple[list[dict[str, str]], str | None]:
+    urls = [u.strip() for u in reference_image_urls if (u or "").strip()]
+    if not urls:
+        return [], None
+
+    first_url = urls[0]
+    started = time.monotonic()
+    print(
+        f"[GEMINI_VEO_REFERENCE_DOWNLOAD_START] project_id={project_id} segment_id={segment_id} "
+        f"reference_image_url={first_url} requested_reference_count={len(urls)} used_reference_count=1",
+        flush=True,
+    )
+    try:
+        with httpx.Client(timeout=timeout, http2=False, verify=True, follow_redirects=True) as client:
+            resp = client.get(first_url)
+    except (httpx.TimeoutException, httpx.RequestError) as exc:
+        message = f"reference image download failed: {exc}"
+        _log_gemini_failure(
+            project_id=project_id,
+            segment_id=segment_id,
+            error_code="GEMINI_VEO_REFERENCE_IMAGE_DOWNLOAD_FAILED",
+            error_message=message,
+            elapsed_seconds=time.monotonic() - started,
+        )
+        return [], message
+
+    elapsed = time.monotonic() - started
+    if resp.status_code >= 400:
+        message = f"reference image download HTTP {resp.status_code}: {_truncate(resp.text or '')}"
+        _log_gemini_failure(
+            project_id=project_id,
+            segment_id=segment_id,
+            error_code="GEMINI_VEO_REFERENCE_IMAGE_DOWNLOAD_FAILED",
+            error_message=message,
+            elapsed_seconds=elapsed,
+        )
+        return [], message
+
+    raw = resp.content or b""
+    if not raw:
+        message = "reference image download returned empty body"
+        _log_gemini_failure(
+            project_id=project_id,
+            segment_id=segment_id,
+            error_code="GEMINI_VEO_REFERENCE_IMAGE_DOWNLOAD_FAILED",
+            error_message=message,
+            elapsed_seconds=elapsed,
+        )
+        return [], message
+
+    mime_type = _image_mime_from_response(raw, resp.headers.get("content-type"))
+    print(
+        f"[GEMINI_VEO_REFERENCE_DOWNLOAD_SUCCESS] project_id={project_id} segment_id={segment_id} "
+        f"bytes_size={len(raw)} mime_type={mime_type} elapsed_seconds={elapsed:.3f}",
+        flush=True,
+    )
+    return [
+        {
+            "bytesBase64Encoded": base64.b64encode(raw).decode("ascii"),
+            "mimeType": mime_type,
+        }
+    ], None
 
 
 def _extract_operation_name(body: Any) -> str | None:
@@ -216,9 +303,25 @@ def generate_gemini_veo_video_sync(
         write=_timeout_seconds(),
         pool=10.0,
     )
+    inline_reference_images, reference_error = download_gemini_reference_images(
+        project_id=project_id,
+        segment_id=segment_id,
+        reference_image_urls=reference_image_urls,
+        timeout=timeout,
+    )
+    if reference_error:
+        return {
+            "ok": False,
+            "provider": "gemini",
+            "model": resolved_model,
+            "error_code": "GEMINI_VEO_REFERENCE_IMAGE_DOWNLOAD_FAILED",
+            "error_message": reference_error,
+            "request_id": "",
+        }
+
     payload = build_gemini_veo_payload(
         prompt=prompt,
-        reference_image_urls=reference_image_urls,
+        inline_reference_images=inline_reference_images,
         aspect_ratio=aspect_ratio,
         duration_seconds=duration_seconds,
         resolution=resolution,
@@ -227,7 +330,7 @@ def generate_gemini_veo_video_sync(
     print(
         f"[GEMINI_VEO_REQUEST] project_id={project_id} segment_id={segment_id} model={resolved_model} "
         f"duration={duration_seconds} aspect_ratio={aspect_ratio} resolution={resolution or ''} "
-        f"reference_image_count={len(payload['instances'][0].get('referenceImages') or [])} "
+        f"reference_image_count={len(inline_reference_images)} reference_mode=inline_image "
         f"prompt_chars={len(prompt or '')} timeout_seconds={_timeout_seconds()} "
         f"poll_timeout_seconds={_poll_timeout_seconds()} poll_interval_seconds={_poll_interval_seconds()}",
         flush=True,

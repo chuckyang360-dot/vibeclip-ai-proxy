@@ -39,6 +39,9 @@ def test_generate_success_download_and_r2(monkeypatch: pytest.MonkeyPatch) -> No
     submit_resp = MagicMock(status_code=200)
     submit_resp.json.return_value = {"name": "operations/op-123"}
 
+    ref_img = MagicMock(status_code=200, content=b"\xff\xd8\xff\xe0" + b"ref")
+    ref_img.headers = {"content-type": "image/jpeg"}
+
     poll_running = MagicMock(status_code=200)
     poll_running.json.return_value = {"done": False}
 
@@ -66,7 +69,7 @@ def test_generate_success_download_and_r2(monkeypatch: pytest.MonkeyPatch) -> No
     with patch("httpx.Client") as client_cls:
         inst = client_cls.return_value.__enter__.return_value
         inst.post.return_value = submit_resp
-        inst.get.side_effect = [poll_running, poll_done, vid_dl]
+        inst.get.side_effect = [ref_img, poll_running, poll_done, vid_dl]
         out = gvu.generate_gemini_veo_video_sync(
             project_id=11,
             segment_id="seg_1",
@@ -78,6 +81,10 @@ def test_generate_success_download_and_r2(monkeypatch: pytest.MonkeyPatch) -> No
             model=None,
         )
 
+    posted_payload = inst.post.call_args.kwargs["json"]
+    assert "referenceImages" not in posted_payload["instances"][0]
+    assert posted_payload["instances"][0]["image"]["mimeType"] == "image/jpeg"
+    assert posted_payload["instances"][0]["image"]["bytesBase64Encoded"]
     assert out["ok"] is True
     assert out["provider"] == "gemini"
     assert out["model"] == "veo-3.1-generate-preview"
