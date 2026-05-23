@@ -77,6 +77,24 @@ def _truncate(text: str, limit: int = 1000) -> str:
     return text[:limit] + "..."
 
 
+def _log_gemini_failure(
+    *,
+    project_id: int,
+    segment_id: str,
+    error_code: str,
+    error_message: str,
+    request_id: str = "",
+    elapsed_seconds: float | None = None,
+) -> None:
+    elapsed_part = "" if elapsed_seconds is None else f" elapsed_seconds={elapsed_seconds:.3f}"
+    print(
+        f"[GEMINI_VEO_FAILED] project_id={project_id} segment_id={segment_id} "
+        f"request_id={request_id} error_code={error_code} "
+        f"error_message={_truncate(str(error_message), 500)}{elapsed_part}",
+        flush=True,
+    )
+
+
 def _append_key(url: str, api_key: str) -> str:
     sep = "&" if "?" in url else "?"
     return f"{url}{sep}key={api_key}"
@@ -175,6 +193,12 @@ def generate_gemini_veo_video_sync(
     api_key = resolve_gemini_api_key()
     resolved_model = resolve_gemini_video_model(model)
     if not api_key:
+        _log_gemini_failure(
+            project_id=project_id,
+            segment_id=segment_id,
+            error_code="GEMINI_API_KEY_NOT_CONFIGURED",
+            error_message="GEMINI_API_KEY is not configured on Railway proxy",
+        )
         return {
             "ok": False,
             "provider": "gemini",
@@ -204,13 +228,23 @@ def generate_gemini_veo_video_sync(
         f"[GEMINI_VEO_REQUEST] project_id={project_id} segment_id={segment_id} model={resolved_model} "
         f"duration={duration_seconds} aspect_ratio={aspect_ratio} resolution={resolution or ''} "
         f"reference_image_count={len(payload['instances'][0].get('referenceImages') or [])} "
-        f"prompt_chars={len(prompt or '')}"
+        f"prompt_chars={len(prompt or '')} timeout_seconds={_timeout_seconds()} "
+        f"poll_timeout_seconds={_poll_timeout_seconds()} poll_interval_seconds={_poll_interval_seconds()}",
+        flush=True,
     )
 
+    started = time.monotonic()
     try:
         with httpx.Client(timeout=timeout, http2=False, verify=True, follow_redirects=True) as client:
             resp = client.post(submit_url, headers={"Content-Type": "application/json"}, json=payload)
     except httpx.TimeoutException as exc:
+        _log_gemini_failure(
+            project_id=project_id,
+            segment_id=segment_id,
+            error_code="GEMINI_VEO_SUBMIT_TIMEOUT",
+            error_message=str(exc),
+            elapsed_seconds=time.monotonic() - started,
+        )
         return {
             "ok": False,
             "provider": "gemini",
@@ -220,6 +254,13 @@ def generate_gemini_veo_video_sync(
             "request_id": "",
         }
     except httpx.RequestError as exc:
+        _log_gemini_failure(
+            project_id=project_id,
+            segment_id=segment_id,
+            error_code="GEMINI_VEO_NETWORK_ERROR",
+            error_message=str(exc),
+            elapsed_seconds=time.monotonic() - started,
+        )
         return {
             "ok": False,
             "provider": "gemini",
@@ -229,7 +270,23 @@ def generate_gemini_veo_video_sync(
             "request_id": "",
         }
 
+    submit_elapsed = time.monotonic() - started
+    submit_body_text = resp.text or ""
+    print(
+        f"[GEMINI_VEO_SUBMIT_RESPONSE] project_id={project_id} segment_id={segment_id} "
+        f"status_code={resp.status_code} elapsed_seconds={submit_elapsed:.3f} "
+        f"body_prefix={_truncate(submit_body_text, 500)}",
+        flush=True,
+    )
+
     if resp.status_code >= 400:
+        _log_gemini_failure(
+            project_id=project_id,
+            segment_id=segment_id,
+            error_code="GEMINI_VEO_HTTP_ERROR",
+            error_message=f"HTTP {resp.status_code}: {_truncate(resp.text or '')}",
+            elapsed_seconds=submit_elapsed,
+        )
         return {
             "ok": False,
             "provider": "gemini",
@@ -242,6 +299,13 @@ def generate_gemini_veo_video_sync(
     try:
         start_data = resp.json()
     except Exception as exc:
+        _log_gemini_failure(
+            project_id=project_id,
+            segment_id=segment_id,
+            error_code="GEMINI_VEO_INVALID_JSON",
+            error_message=str(exc),
+            elapsed_seconds=submit_elapsed,
+        )
         return {
             "ok": False,
             "provider": "gemini",
@@ -253,6 +317,13 @@ def generate_gemini_veo_video_sync(
 
     operation_name = _extract_operation_name(start_data)
     if not operation_name:
+        _log_gemini_failure(
+            project_id=project_id,
+            segment_id=segment_id,
+            error_code="GEMINI_VEO_MISSING_OPERATION",
+            error_message=f"start response missing operation name: {_truncate(str(start_data))}",
+            elapsed_seconds=submit_elapsed,
+        )
         return {
             "ok": False,
             "provider": "gemini",
@@ -265,12 +336,34 @@ def generate_gemini_veo_video_sync(
     poll_url = _append_key(f"{base}/{operation_name}", api_key)
     deadline = time.monotonic() + _poll_timeout_seconds()
     interval = _poll_interval_seconds()
+    print(
+        f"[GEMINI_VEO_OPERATION_CREATED] project_id={project_id} segment_id={segment_id} "
+        f"request_id={operation_name} operation_name={operation_name} "
+        f"submit_elapsed_seconds={submit_elapsed:.3f}",
+        flush=True,
+    )
 
+    poll_attempt = 0
     while time.monotonic() < deadline:
+        poll_attempt += 1
+        poll_started = time.monotonic()
+        print(
+            f"[GEMINI_VEO_POLL_START] project_id={project_id} segment_id={segment_id} "
+            f"request_id={operation_name} attempt={poll_attempt}",
+            flush=True,
+        )
         try:
             with httpx.Client(timeout=timeout, http2=False, verify=True, follow_redirects=True) as client:
                 poll_resp = client.get(poll_url)
         except httpx.TimeoutException as exc:
+            _log_gemini_failure(
+                project_id=project_id,
+                segment_id=segment_id,
+                request_id=operation_name,
+                error_code="GEMINI_VEO_POLL_TIMEOUT",
+                error_message=str(exc),
+                elapsed_seconds=time.monotonic() - poll_started,
+            )
             return {
                 "ok": False,
                 "provider": "gemini",
@@ -280,6 +373,14 @@ def generate_gemini_veo_video_sync(
                 "request_id": operation_name,
             }
         except httpx.RequestError as exc:
+            _log_gemini_failure(
+                project_id=project_id,
+                segment_id=segment_id,
+                request_id=operation_name,
+                error_code="GEMINI_VEO_POLL_NETWORK_ERROR",
+                error_message=str(exc),
+                elapsed_seconds=time.monotonic() - poll_started,
+            )
             return {
                 "ok": False,
                 "provider": "gemini",
@@ -289,7 +390,16 @@ def generate_gemini_veo_video_sync(
                 "request_id": operation_name,
             }
 
+        poll_elapsed = time.monotonic() - poll_started
         if poll_resp.status_code >= 400:
+            _log_gemini_failure(
+                project_id=project_id,
+                segment_id=segment_id,
+                request_id=operation_name,
+                error_code="GEMINI_VEO_POLL_HTTP_ERROR",
+                error_message=f"HTTP {poll_resp.status_code}: {_truncate(poll_resp.text or '')}",
+                elapsed_seconds=poll_elapsed,
+            )
             return {
                 "ok": False,
                 "provider": "gemini",
@@ -302,6 +412,14 @@ def generate_gemini_veo_video_sync(
         try:
             data = poll_resp.json()
         except Exception as exc:
+            _log_gemini_failure(
+                project_id=project_id,
+                segment_id=segment_id,
+                request_id=operation_name,
+                error_code="GEMINI_VEO_POLL_INVALID_JSON",
+                error_message=str(exc),
+                elapsed_seconds=poll_elapsed,
+            )
             return {
                 "ok": False,
                 "provider": "gemini",
@@ -313,12 +431,22 @@ def generate_gemini_veo_video_sync(
 
         print(
             f"[GEMINI_VEO_RESPONSE] project_id={project_id} segment_id={segment_id} "
-            f"request_id={operation_name} done={bool(data.get('done'))}"
+            f"request_id={operation_name} attempt={poll_attempt} status_code={poll_resp.status_code} "
+            f"elapsed_seconds={poll_elapsed:.3f} done={bool(data.get('done'))} "
+            f"body_prefix={_truncate(poll_resp.text or '', 500)}",
+            flush=True,
         )
 
         if bool(data.get("done")):
             operation_error = _extract_operation_error(data)
             if operation_error:
+                _log_gemini_failure(
+                    project_id=project_id,
+                    segment_id=segment_id,
+                    request_id=operation_name,
+                    error_code="GEMINI_VEO_OPERATION_FAILED",
+                    error_message=operation_error,
+                )
                 return {
                     "ok": False,
                     "provider": "gemini",
@@ -329,6 +457,13 @@ def generate_gemini_veo_video_sync(
                 }
             video_uri = _extract_video_uri(data)
             if not video_uri:
+                _log_gemini_failure(
+                    project_id=project_id,
+                    segment_id=segment_id,
+                    request_id=operation_name,
+                    error_code="GEMINI_VEO_MISSING_VIDEO_URI",
+                    error_message=f"done but no video uri: {_truncate(str(data))}",
+                )
                 return {
                     "ok": False,
                     "provider": "gemini",
@@ -340,6 +475,13 @@ def generate_gemini_veo_video_sync(
 
             r2_cfg = load_r2_settings()
             if r2_cfg is None:
+                _log_gemini_failure(
+                    project_id=project_id,
+                    segment_id=segment_id,
+                    request_id=operation_name,
+                    error_code="R2_VIDEO_CONFIG_MISSING",
+                    error_message="R2 not configured",
+                )
                 return {
                     "ok": False,
                     "provider": "gemini",
@@ -357,11 +499,25 @@ def generate_gemini_veo_video_sync(
             seg_safe = sanitize_segment_id_for_r2(segment_id)
             storage_key = f"short-drama/videos/{project_id}/{seg_safe}/{quote(operation_name, safe='')}.mp4"
             download_url = _append_key(video_uri, api_key)
+            print(
+                f"[GEMINI_VEO_DOWNLOAD_START] project_id={project_id} segment_id={segment_id} "
+                f"request_id={operation_name} gemini_video_uri={video_uri}",
+                flush=True,
+            )
 
+            download_started = time.monotonic()
             try:
                 with httpx.Client(timeout=timeout, http2=False, verify=True, follow_redirects=True) as dl_client:
                     vid_resp = dl_client.get(download_url)
             except (httpx.TimeoutException, httpx.RequestError) as exc:
+                _log_gemini_failure(
+                    project_id=project_id,
+                    segment_id=segment_id,
+                    request_id=operation_name,
+                    error_code="GEMINI_VEO_DOWNLOAD_FAILED",
+                    error_message=str(exc),
+                    elapsed_seconds=time.monotonic() - download_started,
+                )
                 return {
                     "ok": False,
                     "provider": "gemini",
@@ -373,6 +529,14 @@ def generate_gemini_veo_video_sync(
                 }
 
             if vid_resp.status_code >= 400:
+                _log_gemini_failure(
+                    project_id=project_id,
+                    segment_id=segment_id,
+                    request_id=operation_name,
+                    error_code="GEMINI_VEO_DOWNLOAD_FAILED",
+                    error_message=f"HTTP {vid_resp.status_code}: {_truncate(vid_resp.text or '')}",
+                    elapsed_seconds=time.monotonic() - download_started,
+                )
                 return {
                     "ok": False,
                     "provider": "gemini",
@@ -384,8 +548,21 @@ def generate_gemini_veo_video_sync(
                 }
 
             raw_mp4 = vid_resp.content
+            print(
+                f"[GEMINI_VEO_DOWNLOAD_SUCCESS] project_id={project_id} segment_id={segment_id} "
+                f"request_id={operation_name} status_code={vid_resp.status_code} "
+                f"bytes_size={len(raw_mp4)} elapsed_seconds={time.monotonic() - download_started:.3f}",
+                flush=True,
+            )
             mx = _max_video_download_bytes()
             if len(raw_mp4) > mx:
+                _log_gemini_failure(
+                    project_id=project_id,
+                    segment_id=segment_id,
+                    request_id=operation_name,
+                    error_code="GEMINI_VEO_DOWNLOAD_FAILED",
+                    error_message=f"video too large: {len(raw_mp4)} bytes (max {mx})",
+                )
                 return {
                     "ok": False,
                     "provider": "gemini",
@@ -396,9 +573,23 @@ def generate_gemini_veo_video_sync(
                     "error_message": f"video too large: {len(raw_mp4)} bytes (max {mx})",
                 }
 
+            print(
+                f"[GEMINI_VEO_R2_UPLOAD_START] project_id={project_id} segment_id={segment_id} "
+                f"request_id={operation_name} r2_key={storage_key} bytes_size={len(raw_mp4)}",
+                flush=True,
+            )
+            upload_started = time.monotonic()
             try:
                 upload_bytes_to_r2(object_key=storage_key, data=raw_mp4, content_type="video/mp4")
             except ClientError as exc:
+                _log_gemini_failure(
+                    project_id=project_id,
+                    segment_id=segment_id,
+                    request_id=operation_name,
+                    error_code="R2_VIDEO_UPLOAD_FAILED",
+                    error_message=_truncate(str(exc)),
+                    elapsed_seconds=time.monotonic() - upload_started,
+                )
                 return {
                     "ok": False,
                     "provider": "gemini",
@@ -409,6 +600,14 @@ def generate_gemini_veo_video_sync(
                     "error_message": _truncate(str(exc)),
                 }
             except Exception as exc:
+                _log_gemini_failure(
+                    project_id=project_id,
+                    segment_id=segment_id,
+                    request_id=operation_name,
+                    error_code="R2_VIDEO_UPLOAD_FAILED",
+                    error_message=_truncate(str(exc)),
+                    elapsed_seconds=time.monotonic() - upload_started,
+                )
                 return {
                     "ok": False,
                     "provider": "gemini",
@@ -421,8 +620,16 @@ def generate_gemini_veo_video_sync(
 
             public_url = f"{r2_cfg.public_base_url}/{quote(storage_key, safe='/')}"
             print(
-                f"[GEMINI_VEO_RESPONSE_READY] request_id={operation_name} success=true "
-                f"video_url={public_url} storage=r2 r2_key={storage_key} model={resolved_model}"
+                f"[GEMINI_VEO_R2_UPLOAD_SUCCESS] project_id={project_id} segment_id={segment_id} "
+                f"request_id={operation_name} r2_key={storage_key} "
+                f"elapsed_seconds={time.monotonic() - upload_started:.3f}",
+                flush=True,
+            )
+            print(
+                f"[GEMINI_VEO_RESPONSE_READY] project_id={project_id} segment_id={segment_id} "
+                f"request_id={operation_name} success=true video_url={public_url} "
+                f"storage=r2 r2_key={storage_key} model={resolved_model}",
+                flush=True,
             )
             return {
                 "ok": True,
@@ -438,6 +645,13 @@ def generate_gemini_veo_video_sync(
 
         time.sleep(interval)
 
+    _log_gemini_failure(
+        project_id=project_id,
+        segment_id=segment_id,
+        request_id=operation_name,
+        error_code="GEMINI_VEO_POLL_TIMEOUT",
+        error_message=f"timed out after {_poll_timeout_seconds()} seconds",
+    )
     return {
         "ok": False,
         "provider": "gemini",
