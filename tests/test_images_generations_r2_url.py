@@ -86,6 +86,77 @@ def test_r2_url_upstream_json_uses_url_not_r2_url(
     assert "r2_url" not in str(posted[0])
 
 
+def test_gemini_image_r2_url_uses_google_generate_content(
+    monkeypatch: pytest.MonkeyPatch,
+    image_client: TestClient,
+) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-key")
+    monkeypatch.setenv("GEMINI_API_URL", "https://generativelanguage.googleapis.com/v1beta")
+    jpeg = b"\xff\xd8\xff\xe0\x00\x10JFIF" + b"\x00" * 40
+    b64 = base64.b64encode(jpeg).decode("ascii")
+    posted: list[dict | None] = []
+    posted_urls: list[str] = []
+    posted_params: list[dict | None] = []
+
+    def capture_upload(*, object_key: str, data: bytes, content_type: str) -> None:
+        assert data.startswith(b"\xff\xd8\xff")
+        assert content_type == "image/jpeg"
+        assert object_key.endswith(".jpg")
+
+    monkeypatch.setattr(main, "upload_bytes_to_r2", capture_upload)
+
+    async def fake_post(url: str, **kwargs: object) -> MagicMock:
+        posted_urls.append(url)
+        posted.append(kwargs.get("json"))  # type: ignore[assignment]
+        posted_params.append(kwargs.get("params"))  # type: ignore[assignment]
+        mr = MagicMock()
+        mr.status_code = 200
+        mr.json.return_value = {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {"inlineData": {"mimeType": "image/jpeg", "data": b64}},
+                        ],
+                    },
+                },
+            ],
+        }
+        return mr
+
+    with patch.object(main.httpx, "AsyncClient") as ac_cls:
+        inst = AsyncMock()
+        ac_cls.return_value.__aenter__.return_value = inst
+        inst.post = AsyncMock(side_effect=fake_post)
+        inst.get = AsyncMock()
+
+        r = image_client.post(
+            "/images/generations",
+            headers={"Authorization": "Bearer proxy-token"},
+            json={
+                "prompt": "a cat",
+                "model": "gemini-3.1-flash-image-preview",
+                "provider": "gemini",
+                "response_format": "r2_url",
+                "project_id": 7,
+                "target_type": "character",
+                "target_id": 42,
+            },
+        )
+
+    assert r.status_code == 200, r.text
+    assert posted_urls == [
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-image-preview:generateContent"
+    ]
+    assert posted_params == [{"key": "gemini-key"}]
+    assert posted[0]["generationConfig"]["responseModalities"] == ["TEXT", "IMAGE"]
+    assert r.json()["storage"] == "r2"
+    assert r.json()["response_format"] == "r2_url"
+    assert r.json()["url"].startswith("https://pub.test.r2.dev/")
+    inst.get.assert_not_called()
+
+
 def test_r2_url_env_b64_json_upstream_no_download(
     monkeypatch: pytest.MonkeyPatch,
     image_client: TestClient,

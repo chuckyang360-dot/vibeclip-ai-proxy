@@ -40,6 +40,7 @@ class S1VisionResponse(BaseModel):
 class ImageGenerationRequest(BaseModel):
     prompt: str
     model: str | None = Field(default=None, description="Image model id; when set, forwarded upstream as-is")
+    provider: str | None = Field(default=None, description="Optional upstream provider hint: xai | gemini")
     response_format: str = Field(
         default="url",
         description="Client: url | b64_json | r2_url (r2_url rehosts to R2; upstream only receives url / b64_json)",
@@ -202,6 +203,61 @@ def resolve_upstream_image_response_format(client_response_format: str) -> str:
     return client_response_format
 
 
+def image_request_is_gemini(body: ImageGenerationRequest, resolved_model: str) -> bool:
+    provider = (body.provider or "").strip().lower()
+    model = (resolved_model or "").strip().lower()
+    return provider == "gemini" or model.startswith("gemini-")
+
+
+def effective_gemini_image_base_url() -> str:
+    return (
+        get_env("GEMINI_IMAGE_BASE_URL")
+        or get_env("GEMINI_BASE_URL")
+        or get_env("GEMINI_API_URL")
+        or "https://generativelanguage.googleapis.com/v1beta"
+    ).rstrip("/")
+
+
+def effective_gemini_image_timeout_seconds() -> float:
+    raw = (
+        get_env("GEMINI_IMAGE_TIMEOUT_SECONDS")
+        or get_env("GEMINI_TIMEOUT_SECONDS")
+        or get_env("REQUEST_TIMEOUT_SECONDS")
+        or "180"
+    )
+    try:
+        return max(5.0, float(raw))
+    except ValueError:
+        return 180.0
+
+
+def extract_first_gemini_image(data: dict[str, Any]) -> tuple[bytes, str]:
+    for cand in data.get("candidates") or []:
+        if not isinstance(cand, dict):
+            continue
+        content = cand.get("content") or {}
+        if not isinstance(content, dict):
+            continue
+        for part in content.get("parts") or []:
+            if not isinstance(part, dict):
+                continue
+            inline = part.get("inlineData") or part.get("inline_data")
+            if not isinstance(inline, dict):
+                continue
+            b64 = inline.get("data")
+            if not isinstance(b64, str) or not b64.strip():
+                continue
+            try:
+                raw = base64.b64decode(b64.strip(), validate=False)
+            except Exception:
+                raise HTTPException(status_code=502, detail="invalid_gemini_b64_image") from None
+            if not raw:
+                raise HTTPException(status_code=502, detail="empty_gemini_image")
+            mime = inline.get("mimeType") or inline.get("mime_type") or _resolve_mime_from_bytes(raw, None)
+            return raw, str(mime)
+    raise HTTPException(status_code=502, detail="missing_gemini_image")
+
+
 def extension_for_mime_image(mime_type: str) -> str:
     m = (mime_type or "").strip().lower().split(";")[0].strip()
     return {
@@ -271,6 +327,126 @@ async def extract_image_bytes_from_upstream(
         return raw, mime
 
     raise HTTPException(status_code=502, detail="missing_image_payload")
+
+
+async def generate_gemini_image_response(
+    *,
+    body: ImageGenerationRequest,
+    request_id: str,
+    resolved_model: str,
+    requested_model_log: str,
+    client_fmt: str,
+) -> ImageGenerationResponse:
+    api_key = get_env("GEMINI_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="gemini_api_key_not_configured")
+
+    base_url = effective_gemini_image_base_url()
+    timeout_seconds = effective_gemini_image_timeout_seconds()
+    endpoint = f"{base_url}/models/{resolved_model}:generateContent"
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": body.prompt}]}],
+        "generationConfig": {
+            "responseModalities": ["TEXT", "IMAGE"],
+            "temperature": 0.9,
+        },
+    }
+    storage_target = "r2" if client_fmt == "r2_url" else "direct"
+    print(
+        f"[GEMINI_IMAGE_REQUEST] request_id={request_id} requested_model={requested_model_log} "
+        f"resolved_model={resolved_model} endpoint={endpoint} client_response_format={client_fmt} "
+        f"storage_target={storage_target} project_id={body.project_id} "
+        f"target_type={body.target_type or ''} target_id={body.target_id} timeout_seconds={timeout_seconds}"
+    )
+    start = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_seconds)) as client:
+            resp = await client.post(endpoint, params={"key": api_key}, json=payload)
+    except httpx.TimeoutException:
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        print(
+            f"[GEMINI_IMAGE_ERROR] request_id={request_id} error_type=upstream_timeout "
+            f"resolved_model={resolved_model} elapsed_ms={elapsed_ms}"
+        )
+        raise HTTPException(status_code=504, detail="gemini_upstream_timeout")
+    except httpx.RequestError as exc:
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        print(
+            f"[GEMINI_IMAGE_ERROR] request_id={request_id} error_type=network_error "
+            f"resolved_model={resolved_model} message={truncate_for_log(str(exc))} elapsed_ms={elapsed_ms}"
+        )
+        raise HTTPException(status_code=502, detail="gemini_network_error")
+
+    elapsed_ms = int((time.perf_counter() - start) * 1000)
+    if resp.status_code >= 400:
+        body_preview = truncate_for_log(resp.text[:800], max_len=800)
+        print(
+            f"[GEMINI_IMAGE_ERROR] request_id={request_id} error_type=upstream_http "
+            f"upstream_status_code={resp.status_code} resolved_model={resolved_model} "
+            f"upstream_body_preview={body_preview} elapsed_ms={elapsed_ms}"
+        )
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "gemini_upstream_error", "status_code": resp.status_code, "body": resp.text[:800]},
+        )
+
+    try:
+        data = resp.json()
+    except json.JSONDecodeError as exc:
+        print(
+            f"[GEMINI_IMAGE_ERROR] request_id={request_id} error_type=json_decode_error "
+            f"resolved_model={resolved_model} message={truncate_for_log(str(exc))} elapsed_ms={elapsed_ms}"
+        )
+        raise HTTPException(status_code=502, detail="gemini_invalid_json")
+
+    raw_bytes, mime_type = extract_first_gemini_image(data)
+    b64 = base64.b64encode(raw_bytes).decode("ascii")
+
+    if client_fmt == "r2_url":
+        r2s = load_r2_settings()
+        if r2s is None:
+            print(
+                f"[GEMINI_IMAGE_ERROR] request_id={request_id} error_type=r2_not_configured "
+                f"resolved_model={resolved_model} elapsed_ms={elapsed_ms}"
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "r2_not_configured: set R2_ENDPOINT or R2_ACCOUNT_ID, "
+                    "R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME, R2_PUBLIC_BASE_URL"
+                ),
+            )
+        object_key = build_image_r2_object_key(
+            project_id=body.project_id,
+            target_type=body.target_type,
+            target_id=body.target_id,
+            proxy_request_id=request_id,
+            mime_type=mime_type,
+        )
+        await asyncio.to_thread(
+            upload_bytes_to_r2,
+            object_key=object_key,
+            data=raw_bytes,
+            content_type=mime_type,
+        )
+        public_url = f"{r2s.public_base_url}/{quote(object_key, safe='/')}"
+        print(
+            f"[GEMINI_IMAGE_RESPONSE] request_id={request_id} success=true storage=r2 "
+            f"r2_url_present=true resolved_model={resolved_model} image_bytes={len(raw_bytes)} "
+            f"mime={mime_type} elapsed_ms={elapsed_ms}"
+        )
+        return ImageGenerationResponse(
+            url=public_url,
+            image_url=public_url,
+            storage="r2",
+            response_format="r2_url",
+        )
+
+    print(
+        f"[GEMINI_IMAGE_RESPONSE] request_id={request_id} success=true storage=direct "
+        f"resolved_model={resolved_model} image_bytes={len(raw_bytes)} mime={mime_type} elapsed_ms={elapsed_ms}"
+    )
+    return ImageGenerationResponse(b64_json=b64, response_format="b64_json")
 
 
 def parse_bearer_token(authorization: str | None) -> str | None:
@@ -535,14 +711,30 @@ async def images_generations(
     request_id = str(uuid.uuid4())
     require_proxy_auth(authorization)
 
+    requested_raw = (body.model or "").strip() if body.model is not None else ""
+    requested_model_log = requested_raw if requested_raw else "(none)"
+    resolved_model, model_source_env = resolve_image_generation_model(body.model)
+    client_fmt = (body.response_format or "url").strip().lower()
+    if client_fmt not in ("url", "b64_json", "r2_url"):
+        raise HTTPException(
+            status_code=400,
+            detail="invalid_response_format: expected url, b64_json, or r2_url",
+        )
+
+    if image_request_is_gemini(body, resolved_model):
+        return await generate_gemini_image_response(
+            body=body,
+            request_id=request_id,
+            resolved_model=resolved_model,
+            requested_model_log=requested_model_log,
+            client_fmt=client_fmt,
+        )
+
     openai_key = os.getenv("OPENAI_API_KEY")
     if openai_key is None or openai_key.strip() == "":
         raise HTTPException(status_code=500, detail="openai_api_key_not_configured")
 
     base_url = get_env("OPENAI_BASE_URL", "https://api.openai.com/v1") or "https://api.openai.com/v1"
-    requested_raw = (body.model or "").strip() if body.model is not None else ""
-    requested_model_log = requested_raw if requested_raw else "(none)"
-    resolved_model, model_source_env = resolve_image_generation_model(body.model)
     provider_label = infer_upstream_provider_label(base_url)
     timeout_raw = get_env("REQUEST_TIMEOUT_SECONDS", "120") or "120"
     try:
@@ -551,13 +743,6 @@ async def images_generations(
         timeout_seconds = 120.0
 
     timeout = httpx.Timeout(timeout_seconds)
-    client_fmt = (body.response_format or "url").strip().lower()
-    if client_fmt not in ("url", "b64_json", "r2_url"):
-        raise HTTPException(
-            status_code=400,
-            detail="invalid_response_format: expected url, b64_json, or r2_url",
-        )
-
     wants_r2 = client_fmt == "r2_url"
     upstream_fmt = resolve_upstream_image_response_format(client_fmt)
     target_response_format = client_fmt
