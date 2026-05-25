@@ -98,6 +98,27 @@ class XaiVideoGenerationResponse(BaseModel):
     error_message: str | None = None
 
 
+class VideoUnderstandingRequest(BaseModel):
+    video_url: str
+    mime_type: str = "video/mp4"
+    system_prompt: str
+    user_payload: dict[str, Any] = Field(default_factory=dict)
+    provider: str | None = None
+    model: str | None = None
+    service_name: str = "reference_video_understanding"
+
+
+class VideoUnderstandingResponse(BaseModel):
+    ok: bool
+    provider: str = "gemini"
+    model: str = ""
+    request_id: str = ""
+    raw_text: str | None = None
+    analysis_json: dict[str, Any] | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+
+
 _MAX_IMAGE_DOWNLOAD_BYTES = 25 * 1024 * 1024
 
 
@@ -158,10 +179,68 @@ def resolve_image_generation_model(body_model: str | None) -> tuple[str, str]:
     return "grok-imagine-image", "default_grok_imagine_image"
 
 
+def resolve_gemini_understanding_model(body_model: str | None) -> tuple[str, str]:
+    if body_model is not None:
+        m = str(body_model).strip()
+        if m:
+            return m, "request_body"
+    for key in ("GEMINI_UNDERSTANDING_MODEL", "GEMINI_VISION_MODEL", "GEMINI_TEXT_MODEL"):
+        v = get_env(key)
+        if v:
+            return v.strip(), key
+    return "gemini-2.5-flash", "default_gemini_2_5_flash"
+
+
+def effective_gemini_understanding_base_url() -> str:
+    return (
+        get_env("GEMINI_UNDERSTANDING_BASE_URL")
+        or get_env("GEMINI_BASE_URL")
+        or get_env("GEMINI_API_URL")
+        or "https://generativelanguage.googleapis.com/v1beta"
+    ).rstrip("/")
+
+
+def effective_gemini_understanding_timeout_seconds() -> float:
+    raw = (
+        get_env("GEMINI_UNDERSTANDING_TIMEOUT_SECONDS")
+        or get_env("GEMINI_TIMEOUT_SECONDS")
+        or get_env("REQUEST_TIMEOUT_SECONDS")
+        or "300"
+    )
+    try:
+        return max(30.0, float(raw))
+    except ValueError:
+        return 300.0
+
+
 def truncate_for_log(text: str, max_len: int = 500) -> str:
     if len(text) <= max_len:
         return text
     return text[:max_len] + "...(truncated)"
+
+
+def try_parse_json_object(text: str) -> dict[str, Any] | None:
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("```"):
+        raw = raw.strip("`").strip()
+        if raw.lower().startswith("json"):
+            raw = raw[4:].strip()
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        pass
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            parsed = json.loads(raw[start : end + 1])
+            return parsed if isinstance(parsed, dict) else None
+        except json.JSONDecodeError:
+            return None
+    return None
 
 
 def _mime_from_content_type(content_type: str | None) -> str | None:
@@ -537,6 +616,150 @@ async def gemini_videos_generations(
         model=body.model,
     )
     return XaiVideoGenerationResponse(**result)
+
+
+async def run_gemini_video_understanding(
+    body: VideoUnderstandingRequest,
+    request_id: str,
+) -> VideoUnderstandingResponse:
+    api_key = get_env("GEMINI_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="gemini_api_key_not_configured")
+
+    model, model_source = resolve_gemini_understanding_model(body.model)
+    base_url = effective_gemini_understanding_base_url()
+    timeout_seconds = effective_gemini_understanding_timeout_seconds()
+    endpoint = f"{base_url}/models/{model}:generateContent"
+    video_url = (body.video_url or "").strip()
+    if not video_url:
+        raise HTTPException(status_code=400, detail="video_url_required")
+
+    user_payload_text = json.dumps(body.user_payload or {}, ensure_ascii=False, default=str)
+    payload = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {"fileData": {"mimeType": body.mime_type or "video/mp4", "fileUri": video_url}},
+                    {"text": user_payload_text},
+                ],
+            }
+        ],
+        "systemInstruction": {
+            "parts": [{"text": body.system_prompt}],
+        },
+        "generationConfig": {
+            "temperature": 0.2,
+            "responseMimeType": "application/json",
+        },
+    }
+
+    print(
+        f"[GEMINI_VIDEO_UNDERSTANDING_REQUEST] request_id={request_id} model={model} "
+        f"model_source={model_source} endpoint={endpoint} mime_type={body.mime_type} "
+        f"service_name={body.service_name} payload_chars={len(user_payload_text)} "
+        f"timeout_seconds={timeout_seconds}",
+        flush=True,
+    )
+    start = time.perf_counter()
+    timeout = httpx.Timeout(timeout_seconds, connect=min(30.0, timeout_seconds))
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            resp = await client.post(endpoint, params={"key": api_key}, json=payload)
+    except httpx.TimeoutException:
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        print(
+            f"[GEMINI_VIDEO_UNDERSTANDING_ERROR] request_id={request_id} error_type=upstream_timeout "
+            f"model={model} elapsed_ms={elapsed_ms}",
+            flush=True,
+        )
+        raise HTTPException(status_code=504, detail="gemini_video_understanding_timeout")
+    except httpx.RequestError as exc:
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        print(
+            f"[GEMINI_VIDEO_UNDERSTANDING_ERROR] request_id={request_id} error_type=network_error "
+            f"model={model} message={truncate_for_log(str(exc))} elapsed_ms={elapsed_ms}",
+            flush=True,
+        )
+        raise HTTPException(status_code=502, detail="gemini_video_understanding_network_error")
+
+    elapsed_ms = int((time.perf_counter() - start) * 1000)
+    if resp.status_code >= 400:
+        body_preview = truncate_for_log(resp.text[:1200], max_len=1200)
+        print(
+            f"[GEMINI_VIDEO_UNDERSTANDING_ERROR] request_id={request_id} error_type=upstream_http "
+            f"upstream_status_code={resp.status_code} model={model} body={body_preview} elapsed_ms={elapsed_ms}",
+            flush=True,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "gemini_video_understanding_upstream_error", "status_code": resp.status_code, "body": resp.text[:1200]},
+        )
+
+    try:
+        data = resp.json()
+    except json.JSONDecodeError as exc:
+        print(
+            f"[GEMINI_VIDEO_UNDERSTANDING_ERROR] request_id={request_id} error_type=json_decode_error "
+            f"model={model} message={truncate_for_log(str(exc))} elapsed_ms={elapsed_ms}",
+            flush=True,
+        )
+        raise HTTPException(status_code=502, detail="gemini_video_understanding_invalid_json")
+
+    raw_text = ""
+    for cand in data.get("candidates") or []:
+        if not isinstance(cand, dict):
+            continue
+        content = cand.get("content") or {}
+        if not isinstance(content, dict):
+            continue
+        for part in content.get("parts") or []:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                raw_text += part["text"]
+    raw_text = raw_text.strip()
+    if not raw_text:
+        print(
+            f"[GEMINI_VIDEO_UNDERSTANDING_ERROR] request_id={request_id} error_type=empty_output "
+            f"model={model} elapsed_ms={elapsed_ms}",
+            flush=True,
+        )
+        raise HTTPException(status_code=502, detail="gemini_video_understanding_empty_output")
+
+    analysis_json = try_parse_json_object(raw_text)
+    if analysis_json is None:
+        print(
+            f"[GEMINI_VIDEO_UNDERSTANDING_ERROR] request_id={request_id} error_type=json_parse_failed "
+            f"model={model} raw_text={truncate_for_log(raw_text, 800)} elapsed_ms={elapsed_ms}",
+            flush=True,
+        )
+        raise HTTPException(status_code=502, detail="gemini_video_understanding_json_parse_failed")
+
+    print(
+        f"[GEMINI_VIDEO_UNDERSTANDING_RESPONSE] request_id={request_id} success=true "
+        f"model={model} raw_length={len(raw_text)} elapsed_ms={elapsed_ms}",
+        flush=True,
+    )
+    return VideoUnderstandingResponse(
+        ok=True,
+        provider="gemini",
+        model=model,
+        request_id=request_id,
+        raw_text=raw_text,
+        analysis_json=analysis_json,
+    )
+
+
+@app.post("/api/gemini/video-understanding", response_model=VideoUnderstandingResponse)
+@app.post("/api/gemini/videos/understanding", response_model=VideoUnderstandingResponse)
+@app.post("/api/video/understanding", response_model=VideoUnderstandingResponse)
+@app.post("/video/understanding", response_model=VideoUnderstandingResponse)
+async def gemini_video_understanding(
+    body: VideoUnderstandingRequest,
+    authorization: Annotated[str | None, Header(alias="Authorization")] = None,
+) -> VideoUnderstandingResponse:
+    """VibeClip backend -> Railway -> Gemini video understanding; returns strict analysis JSON."""
+    require_proxy_auth(authorization)
+    return await run_gemini_video_understanding(body, str(uuid.uuid4()))
 
 
 @app.post("/text/completions", response_model=S1VisionResponse)
