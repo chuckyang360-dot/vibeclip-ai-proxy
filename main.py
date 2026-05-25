@@ -213,6 +213,220 @@ def effective_gemini_understanding_timeout_seconds() -> float:
         return 300.0
 
 
+def max_video_understanding_download_bytes() -> int:
+    raw = get_env("GEMINI_UNDERSTANDING_MAX_DOWNLOAD_BYTES") or get_env("MAX_VIDEO_DOWNLOAD_BYTES") or str(512 * 1024 * 1024)
+    try:
+        return max(1_000_000, int(raw))
+    except ValueError:
+        return 512 * 1024 * 1024
+
+
+async def download_video_for_understanding(
+    *,
+    video_url: str,
+    request_id: str,
+    timeout_seconds: float,
+) -> tuple[bytes, str | None]:
+    max_bytes = max_video_understanding_download_bytes()
+    timeout = httpx.Timeout(timeout_seconds, connect=min(30.0, timeout_seconds))
+    started = time.perf_counter()
+    print(
+        f"[GEMINI_VIDEO_UNDERSTANDING_DOWNLOAD_START] request_id={request_id} "
+        f"max_bytes={max_bytes}",
+        flush=True,
+    )
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            async with client.stream("GET", video_url) as resp:
+                if resp.status_code >= 400:
+                    body = await resp.aread()
+                    print(
+                        f"[GEMINI_VIDEO_UNDERSTANDING_DOWNLOAD_ERROR] request_id={request_id} "
+                        f"status_code={resp.status_code} body={truncate_for_log(body.decode('utf-8', errors='ignore'), 500)}",
+                        flush=True,
+                    )
+                    raise HTTPException(status_code=502, detail="video_download_failed")
+                content_length = resp.headers.get("content-length")
+                if content_length:
+                    try:
+                        if int(content_length) > max_bytes:
+                            raise HTTPException(status_code=413, detail="video_too_large_for_understanding")
+                    except ValueError:
+                        pass
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in resp.aiter_bytes():
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise HTTPException(status_code=413, detail="video_too_large_for_understanding")
+                    chunks.append(chunk)
+                raw = b"".join(chunks)
+                if not raw:
+                    raise HTTPException(status_code=502, detail="video_download_empty")
+                elapsed_ms = int((time.perf_counter() - started) * 1000)
+                print(
+                    f"[GEMINI_VIDEO_UNDERSTANDING_DOWNLOAD_SUCCESS] request_id={request_id} "
+                    f"bytes={len(raw)} content_type={resp.headers.get('content-type') or ''} elapsed_ms={elapsed_ms}",
+                    flush=True,
+                )
+                return raw, resp.headers.get("content-type")
+    except HTTPException:
+        raise
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="video_download_timeout") from None
+    except httpx.RequestError as exc:
+        print(
+            f"[GEMINI_VIDEO_UNDERSTANDING_DOWNLOAD_ERROR] request_id={request_id} "
+            f"error_type=network_error message={truncate_for_log(str(exc))}",
+            flush=True,
+        )
+        raise HTTPException(status_code=502, detail="video_download_network_error") from exc
+
+
+def normalize_video_mime(request_mime: str, downloaded_content_type: str | None) -> str:
+    requested = _mime_from_content_type(request_mime)
+    if requested and requested.startswith("video/"):
+        return requested
+    downloaded = _mime_from_content_type(downloaded_content_type)
+    if downloaded and downloaded.startswith("video/"):
+        return downloaded
+    return "video/mp4"
+
+
+async def upload_video_to_gemini_file_api(
+    *,
+    video_bytes: bytes,
+    mime_type: str,
+    request_id: str,
+    api_key: str,
+    display_name: str,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    upload_start_url = "https://generativelanguage.googleapis.com/upload/v1beta/files"
+    timeout = httpx.Timeout(timeout_seconds, connect=min(30.0, timeout_seconds))
+    headers = {
+        "x-goog-api-key": api_key,
+        "X-Goog-Upload-Protocol": "resumable",
+        "X-Goog-Upload-Command": "start",
+        "X-Goog-Upload-Header-Content-Length": str(len(video_bytes)),
+        "X-Goog-Upload-Header-Content-Type": mime_type,
+        "Content-Type": "application/json",
+    }
+    started = time.perf_counter()
+    print(
+        f"[GEMINI_FILE_UPLOAD_START] request_id={request_id} bytes={len(video_bytes)} mime_type={mime_type}",
+        flush=True,
+    )
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            start_resp = await client.post(
+                upload_start_url,
+                headers=headers,
+                json={"file": {"display_name": display_name}},
+            )
+            if start_resp.status_code >= 400:
+                print(
+                    f"[GEMINI_FILE_UPLOAD_ERROR] request_id={request_id} step=start "
+                    f"status_code={start_resp.status_code} body={truncate_for_log(start_resp.text, 1000)}",
+                    flush=True,
+                )
+                raise HTTPException(
+                    status_code=502,
+                    detail={"error": "gemini_file_upload_start_failed", "status_code": start_resp.status_code, "body": start_resp.text[:1000]},
+                )
+            upload_url = start_resp.headers.get("x-goog-upload-url") or start_resp.headers.get("X-Goog-Upload-URL")
+            if not upload_url:
+                raise HTTPException(status_code=502, detail="gemini_file_upload_url_missing")
+
+            upload_resp = await client.post(
+                upload_url,
+                headers={
+                    "Content-Length": str(len(video_bytes)),
+                    "X-Goog-Upload-Offset": "0",
+                    "X-Goog-Upload-Command": "upload, finalize",
+                    "Content-Type": mime_type,
+                },
+                content=video_bytes,
+            )
+            if upload_resp.status_code >= 400:
+                print(
+                    f"[GEMINI_FILE_UPLOAD_ERROR] request_id={request_id} step=finalize "
+                    f"status_code={upload_resp.status_code} body={truncate_for_log(upload_resp.text, 1000)}",
+                    flush=True,
+                )
+                raise HTTPException(
+                    status_code=502,
+                    detail={"error": "gemini_file_upload_finalize_failed", "status_code": upload_resp.status_code, "body": upload_resp.text[:1000]},
+                )
+            try:
+                data = upload_resp.json()
+            except json.JSONDecodeError:
+                raise HTTPException(status_code=502, detail="gemini_file_upload_invalid_json") from None
+    except HTTPException:
+        raise
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="gemini_file_upload_timeout") from None
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail="gemini_file_upload_network_error") from exc
+
+    file_obj = data.get("file") if isinstance(data, dict) else None
+    if not isinstance(file_obj, dict):
+        raise HTTPException(status_code=502, detail="gemini_file_upload_missing_file")
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    print(
+        f"[GEMINI_FILE_UPLOAD_SUCCESS] request_id={request_id} "
+        f"name={file_obj.get('name') or ''} uri_present={bool(file_obj.get('uri'))} "
+        f"state={file_obj.get('state') or ''} elapsed_ms={elapsed_ms}",
+        flush=True,
+    )
+    return file_obj
+
+
+async def wait_for_gemini_file_active(
+    *,
+    file_obj: dict[str, Any],
+    api_key: str,
+    request_id: str,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    name = str(file_obj.get("name") or "").strip()
+    state = str(file_obj.get("state") or "").strip().upper()
+    if state == "ACTIVE" or not name:
+        return file_obj
+    deadline = time.monotonic() + min(max(30.0, timeout_seconds), 300.0)
+    get_url = f"https://generativelanguage.googleapis.com/v1beta/{name}"
+    timeout = httpx.Timeout(30.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        while time.monotonic() < deadline:
+            await asyncio.sleep(2.0)
+            resp = await client.get(get_url, params={"key": api_key})
+            if resp.status_code >= 400:
+                print(
+                    f"[GEMINI_FILE_POLL_ERROR] request_id={request_id} status_code={resp.status_code} "
+                    f"body={truncate_for_log(resp.text, 500)}",
+                    flush=True,
+                )
+                raise HTTPException(status_code=502, detail="gemini_file_poll_failed")
+            try:
+                current = resp.json()
+            except json.JSONDecodeError:
+                raise HTTPException(status_code=502, detail="gemini_file_poll_invalid_json") from None
+            if not isinstance(current, dict):
+                raise HTTPException(status_code=502, detail="gemini_file_poll_invalid_response")
+            state = str(current.get("state") or "").strip().upper()
+            print(
+                f"[GEMINI_FILE_POLL] request_id={request_id} name={name} state={state}",
+                flush=True,
+            )
+            if state == "ACTIVE":
+                return current
+            if state == "FAILED":
+                raise HTTPException(status_code=502, detail="gemini_file_processing_failed")
+    raise HTTPException(status_code=504, detail="gemini_file_processing_timeout")
+
+
 def truncate_for_log(text: str, max_len: int = 500) -> str:
     if len(text) <= max_len:
         return text
@@ -634,13 +848,38 @@ async def run_gemini_video_understanding(
     if not video_url:
         raise HTTPException(status_code=400, detail="video_url_required")
 
+    video_bytes, downloaded_content_type = await download_video_for_understanding(
+        video_url=video_url,
+        request_id=request_id,
+        timeout_seconds=timeout_seconds,
+    )
+    effective_mime_type = normalize_video_mime(body.mime_type or "", downloaded_content_type)
+    file_obj = await upload_video_to_gemini_file_api(
+        video_bytes=video_bytes,
+        mime_type=effective_mime_type,
+        request_id=request_id,
+        api_key=api_key,
+        display_name=f"reference-video-{request_id}",
+        timeout_seconds=timeout_seconds,
+    )
+    file_obj = await wait_for_gemini_file_active(
+        file_obj=file_obj,
+        api_key=api_key,
+        request_id=request_id,
+        timeout_seconds=timeout_seconds,
+    )
+    file_uri = str(file_obj.get("uri") or "").strip()
+    if not file_uri:
+        raise HTTPException(status_code=502, detail="gemini_file_uri_missing")
+    effective_mime_type = str(file_obj.get("mimeType") or effective_mime_type).strip() or effective_mime_type
+
     user_payload_text = json.dumps(body.user_payload or {}, ensure_ascii=False, default=str)
     payload = {
         "contents": [
             {
                 "role": "user",
                 "parts": [
-                    {"fileData": {"mimeType": body.mime_type or "video/mp4", "fileUri": video_url}},
+                    {"fileData": {"mimeType": effective_mime_type, "fileUri": file_uri}},
                     {"text": user_payload_text},
                 ],
             }
@@ -656,7 +895,8 @@ async def run_gemini_video_understanding(
 
     print(
         f"[GEMINI_VIDEO_UNDERSTANDING_REQUEST] request_id={request_id} model={model} "
-        f"model_source={model_source} endpoint={endpoint} mime_type={body.mime_type} "
+        f"model_source={model_source} endpoint={endpoint} mime_type={effective_mime_type} "
+        f"file_name={file_obj.get('name') or ''} "
         f"service_name={body.service_name} payload_chars={len(user_payload_text)} "
         f"timeout_seconds={timeout_seconds}",
         flush=True,
